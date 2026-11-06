@@ -8,10 +8,12 @@ Studio worker AND the matching YouTube skill/tool where one exists:
   1. Research     — TopicResearcher + yt-viral swipe.py
   2. Script       — ScriptWriter + yt-script hookscore.py (21 formulas)
   3. Visual+Pack  — VisualProducer + yt-package title.py (title+thumb)
-  4. Video        — Reel Factory build (real footage + TTS + captions
-                    + exact-logo end card; without --footage it writes
-                    the production plan + the exact missing inputs and
-                    builds no video)
+  4. Video        — Reel Factory build: real footage when --footage
+                    is given, otherwise AI-generated stills
+                    (Pollinations, free) + slow Ken Burns motion.
+                    With --no-gen-visuals and no footage it writes
+                    the production plan + the exact missing inputs
+                    and builds no video.
   5. Edit         — yt-edit deadair.py + yt-chapters chapters.py
                     + yt-shorts (needs --transcript, else skipped honestly)
   6. Caption+SEO  — CaptionWriter + yt-seo (description/tags)
@@ -25,14 +27,16 @@ Usage:
       [--transcript transcript.srt] [--retention retention.csv]
       [--collected collected.json] [--hours 6] [--out out/dir]
       [--footage footage.mp4] [--voice avocado_v2:MAI_01]
+      [--gen-visuals | --no-gen-visuals]
 
 Mock mode is the DEFAULT: the workers draft through MockLLM (offline,
 deterministic, $0) and the YouTube tools are local Python with no
-network and no keys. The video stage builds a local mp4 only when
-footage is supplied (FFmpeg + the local `tts` binary, $0). Nothing
-here publishes, sends, uploads, schedules, or spends. The run ends
-with "ship it, or change it?" and exits — the owner publishes, if at
-all, with their own word.
+network and no keys. The video stage builds a local mp4 from real
+footage when supplied, otherwise from AI-generated stills
+(Pollinations, free — the ONLY network call in this repo, see
+scripts/gen_visuals.py). Nothing here publishes, sends, uploads,
+schedules, or spends. The run ends with "ship it, or change it?" and
+exits — the owner publishes, if at all, with their own word.
 """
 from __future__ import annotations
 
@@ -272,15 +276,29 @@ def stage_visual(args, out_dir: Path, llm: MockLLM) -> Path:
 
 def stage_video(args, out_dir: Path) -> Path:
     # The header is written by hand here: the video stage is a local
-    # build (FFmpeg + the tts binary), not a mock draft, so the generic
-    # "no network" line in stage_header would not be honest about TTS
-    # (the tts binary synthesises through its own service; this repo
-    # itself makes no network calls).
+    # build (FFmpeg + the tts binary, plus Pollinations image
+    # generation when no footage is given), not a mock draft, so the
+    # generic "no network" line in stage_header would not be honest
+    # about TTS (the tts binary synthesises through its own service)
+    # or about Pollinations (the one network call in this repo).
     result = build_video(args, out_dir, out_dir / "video_work")
+    if result["source"] == "real footage":
+        sources = ("Reel Factory build — real footage + TTS voiceover "
+                   "+ burned-in captions + exact-logo end card")
+        mode = "local build (FFmpeg + tts binary, $0)"
+    elif result["gen"]["attempted"]:
+        sources = ("Reel Factory build — AI-generated stills + slow "
+                   "Ken Burns motion (Pollinations, free) + TTS voiceover "
+                   "+ burned-in captions + exact-logo end card")
+        mode = ("local build (FFmpeg + tts binary + Pollinations image "
+                "generation, $0, no key)")
+    else:
+        sources = ("Reel Factory build — real footage + TTS voiceover "
+                   "+ burned-in captions + exact-logo end card")
+        mode = "local build (FFmpeg + tts binary, $0)"
     text = ("# Stage 4 — Video (Reel Factory)\n\n"
-            "Sources: Reel Factory build — real footage + TTS voiceover "
-            "+ burned-in captions + exact-logo end card\n"
-            "Mode: local build (FFmpeg + tts binary, $0). "
+            f"Sources: {sources}\n"
+            f"Mode: {mode}. "
             f"{GATE_NOTE}\nGate: `upload it`\n\n---\n")
     plan = result["plan"]
     if result["built"]:
@@ -298,6 +316,19 @@ def stage_video(args, out_dir: Path) -> Path:
         for item in result["missing"]:
             text += f"- {item}\n"
         text += "\n"
+    if result["gen"]["attempted"]:
+        text += "## Visual source\n\n"
+        text += f"- Source: {result['source']}\n"
+        for rec in result["gen"]["per_scene"]:
+            if rec["ok"]:
+                text += (f"- Scene {rec['scene']}: still generated — "
+                         f"`{rec['path']}` ({rec['note']})\n")
+            else:
+                text += (f"- Scene {rec['scene']}: GENERATION FAILED — "
+                         f"{rec['note']}\n")
+        text += ("\nAI stills + motion: the images are AI-generated "
+                 "stills given slow zoom/pan motion. That is not real "
+                 "footage and not true AI video motion.\n\n")
     text += "## Production plan (shot list)\n\n"
     for scene in plan.get("scenes", []):
         text += (f"- Scene {scene['scene']} ({scene['seconds']}): "
@@ -334,8 +365,11 @@ def stage_video(args, out_dir: Path) -> Path:
             for fb in result["fallbacks"]:
                 text += f"- {fb}\n"
     text += ("\n## Limits\n\n"
-             "- No AI text-to-video generation exists here "
-             "(region-blocked) — footage-based assembly only.\n"
+             "- No true AI text-to-video generation exists here "
+             "(region-blocked). Without footage, the stage generates "
+             "AI stills (Pollinations, free) and gives them slow "
+             "Ken Burns motion — AI stills + motion, not real footage "
+             "and not true AI video motion.\n"
              "- Voiceover lines are templated from the brand pitch; "
              "rewrite them before shipping.\n"
              "- This file is a build record, not an upload. Gate: "
@@ -524,6 +558,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Output dir (default: out/<slug>-<YYYY-MM-DD>/).")
     ap.add_argument("--footage", default="",
                     help="Video file or folder of clips for the video stage.")
+    ap.add_argument("--gen-visuals", dest="gen_visuals",
+                    action="store_true", default=True,
+                    help="Generate AI stills when no --footage is given "
+                         "(default: on).")
+    ap.add_argument("--no-gen-visuals", dest="gen_visuals",
+                    action="store_false",
+                    help="Do not generate stills; without --footage the "
+                         "video stage builds no video.")
     ap.add_argument("--voice", default="avocado_v2:MAI_01",
                     help="TTS voice id for the video stage voiceover.")
     ap.add_argument("--no-video", action="store_true",

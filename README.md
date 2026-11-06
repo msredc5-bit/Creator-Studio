@@ -26,10 +26,13 @@ CEO decision (gate: ok)
   1. Research     — TopicResearcher + yt-viral swipe.py
   2. Script       — ScriptWriter + yt-script hookscore.py (21 formulas)
   3. Visual+Pack  — VisualProducer + yt-package title.py (title+thumb)
-  4. Video        — Reel Factory build: real footage + TTS voiceover
-                    + burned-in captions + exact-logo end card.
-                    Without --footage it writes the production plan
-                    + the exact missing inputs and builds no video.
+  4. Video        — Reel Factory build: real footage when --footage
+                    is given, otherwise AI-generated stills
+                    (Pollinations, free) + slow Ken Burns motion —
+                    topic in, video out, no footage needed.
+                    With --no-gen-visuals and no footage it writes
+                    the production plan + the exact missing inputs
+                    and builds no video.
   5. Edit         — yt-edit deadair.py + yt-chapters + yt-shorts
                     (needs --transcript, else skipped honestly)
   6. Caption+SEO  — CaptionWriter + yt-seo (description + tags)
@@ -57,24 +60,47 @@ python3 scripts/creator_os_run.py --topic "AI receptionist for plumbers" \
     --footage footage.mp4 --voice avocado_v2:MAI_01
 ```
 
+No footage? Just leave `--footage` out — the video stage generates
+its own stills (see below) and the run still ends with a real
+`video.mp4`. Pass `--no-gen-visuals` to turn generation off.
+
 Output: `out/<slug>-<YYYY-MM-DD>/` with one markdown draft per
 stage (`00-plan.md` … `08-report.md`). The run ends by printing
 **"ship it, or change it?"** and exits.
 
 ## The video stage (stage 4, Reel Factory)
 
-Needs: real footage — one video file, or a folder of clips, passed
-with `--footage <path>`. The story order is fixed: (1) a real worker
-working, (2) a phone ringing and missed, (3) Talvenor answering and
-booking. Real footage only; no stills with motion.
+Two visual sources, in order of preference:
 
-Produces (video formats only): `<out-dir>/video.mp4` — footage
+1. **Real footage (preferred)** — one video file, or a folder of
+   clips, passed with `--footage <path>`. The story order is fixed:
+   (1) a real worker working, (2) a phone ringing and missed,
+   (3) Talvenor answering and booking. Real footage only; when it
+   is supplied, no stills are ever generated.
+2. **AI-generated stills (default when no footage is given)** — the
+   stage generates one still per scene itself (Pollinations.ai,
+   free, no API key — see `scripts/gen_visuals.py`) and gives each
+   still slow Ken Burns motion (FFmpeg zoompan: zoom in, zoom out,
+   slow pan). Topic in, video out, no footage input needed. Turn
+   it off with `--no-gen-visuals`; force it on with
+   `--gen-visuals` (it is already the default when no footage is
+   supplied).
+
+Produces (video formats only): `<out-dir>/video.mp4` — visuals
 scaled/cropped to 9:16 1080x1920 for short video (16:9 1920x1080 for
 long video), 30fps, H.264 + AAC, faststart — plus `04-video.md`,
-which records exactly what was built (scenes, voiceover lines, end
-card, verification) and any fallbacks. Intermediates live in
-`<out-dir>/video_work/` so the build is rebuildable.
+which records exactly what was built (visual source, scenes,
+voiceover lines, end card, verification) and any fallbacks.
+Intermediates live in `<out-dir>/video_work/` (stills in
+`video_work/stills/`) so the build is rebuildable.
 
+- Generation details: prompts show workers from behind / hands /
+  over-the-shoulder — never a recognizable face, never a named real
+  person. One retry with a simpler prompt per scene; a scene that
+  still fails gets a plain dark slate, recorded honestly. If all 3
+  scenes fail, no video is built and the stage file records exactly
+  why. The bottom 8% of each still is cropped (Pollinations
+  watermark corner).
 - Voiceover: the three templated brand lines, spoken by the
   `tts` binary (default voice `avocado_v2:MAI_01` — Sophia/Aria;
   override with `--voice`). If synthesis fails, that line plays
@@ -87,13 +113,22 @@ card, verification) and any fallbacks. Intermediates live in
   on black, never redrawn, with the brand line "You run the jobs.
   We run the phone." and the CTA "Book a call with Talvenor.
   Link in bio."
-- Without `--footage` (or with `--no-video`): the stage still runs
-  and writes its plan + the exact missing inputs. It builds no
-  video and claims none.
+- Without `--footage` AND with `--no-gen-visuals` (or with
+  `--no-video`): the stage still runs and writes its plan + the
+  exact missing inputs. It builds no video and claims none.
 
-Honest limits: no AI text-to-video generation exists here
-(region-blocked) — footage-based assembly only. The video is a
-local file; the run never uploads it (gate: `upload it`).
+Honest limits: no true AI text-to-video generation exists here
+(region-blocked) — the generated path is AI stills + motion, not
+real footage and not true AI video motion. Generated stills are
+draft quality (free sana model: soft detail, weak prompt
+adherence, occasional watermark) — good enough to prove the
+pipeline end to end, not final creative. The video is a local
+file; the run never uploads it (gate: `upload it`).
+
+Future path: true video motion needs either local video models on
+Boss's own PC GPU (GPU name still unknown — that decides which
+model runs) or a paid cloud video service (Boss's spend decision).
+Neither is wired in yet.
 
 ## Gates (the rule that never bends)
 
@@ -118,7 +153,10 @@ src/
 scripts/
   creator_os_run.py        — the 9-stage combined runner
   video_build.py           — Reel Factory video stage (FFmpeg + tts,
-                             footage-based assembly only)
+                             footage or generated stills + motion)
+  gen_visuals.py           — AI still generation (Pollinations, free,
+                             no key) — the ONLY network-calling module
+                             in this repo
 tests/
   test_combined.py         — pytest, mock end-to-end (replaces the old
                              boss-ceo-dependent test_creator.py)
@@ -142,13 +180,18 @@ out/                       — generated stage drafts (gitignored)
 - **Stages that need your files say so.** No transcript → stage 5 is
   skipped honestly. No retention export → stage 8 reads nothing.
   No collected videos → swipe.py does not run. No footage → stage 4
-  builds no video and names the exact footage needed. Missing inputs
-  are named, never invented.
-- **No network calls anywhere in `src/`, `scripts/`, or `tests/`**
-  (enforced by a test). The live-LLM hook (`LiveLLMProvider` in
-  `src/workers/base.py`) reads its key only from the environment
-  variable `CREATOR_OS_LLM_API_KEY` and is deliberately unwired —
-  this repo makes no network calls by design.
+  generates AI stills itself (or, with `--no-gen-visuals`, builds no
+  video and names the exact footage needed). Missing inputs are
+  named, never invented.
+- **Almost no network calls.** The core pipeline (`src/`, the runner,
+  the YouTube tools) makes no network calls. The ONLY exception is
+  `scripts/gen_visuals.py`, which fetches free stills from
+  Pollinations.ai (no API key) — clearly documented in the module
+  and enforced by a test (`test_gen_visuals_is_the_only_network_module`).
+  The live-LLM hook (`LiveLLMProvider` in `src/workers/base.py`)
+  reads its key only from the environment variable
+  `CREATOR_OS_LLM_API_KEY` and is deliberately unwired — this repo
+  makes no other network calls by design.
 - **Performance numbers are never estimated** — only what the owner
   pastes from the platforms.
 
@@ -179,3 +222,5 @@ repo).
   commit `53a5a99b`, 29 files (the 8-stage combined repo).
 - The video stage (stage 4) was added after that push and is **not
   pushed yet** — pushing is a separate step, handled by the parent.
+  The AI-stills generation for stage 4 (this change) is also not
+  pushed yet.

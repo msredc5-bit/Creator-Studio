@@ -1,4 +1,6 @@
-"""Creator OS combined tests — offline, mock mode only.
+"""Creator OS combined tests — offline, mock mode only, except the one
+generation test (which calls the free Pollinations image service once
+and passes honestly either way if the network fails).
 
 Run with pytest (preferred):
   python3 -m pytest tests/ -q
@@ -6,7 +8,8 @@ Run with pytest (preferred):
 Or directly (stdlib fallback, same checks):
   python3 tests/test_combined.py
 
-$0 spend. No network, no keys, nothing publishes.
+$0 spend. No network except the generation test, no keys, nothing
+publishes.
 """
 from __future__ import annotations
 
@@ -63,12 +66,15 @@ def test_mock_llm_is_labelled_and_offline():
 
 
 def _run_mock_pipeline(tmp_path: Path) -> Path:
+    # --no-gen-visuals keeps the shared mock helper offline and fast:
+    # generation is tested separately, once, in its own test.
     out_dir = tmp_path / "out"
     code = run_pipeline([
         "--topic", "AI receptionist for plumbers",
         "--format", "short video",
         "--niche", "US home-service owners",
         "--audience", "plumbers who miss calls on the job",
+        "--no-gen-visuals",
         "--out", str(out_dir),
     ])
     assert code == 0
@@ -133,6 +139,7 @@ def test_video_stage_without_footage_states_missing_inputs(tmp_path):
     assert "Missing inputs" in text
     assert "--footage" in text
     assert "a real worker working" in text
+    assert "no-gen-visuals" in text
     assert not (out_dir / "video.mp4").exists()
 
 
@@ -182,16 +189,105 @@ def test_video_stage_builds_real_mp4_with_footage(tmp_path):
     assert "You run the jobs. We run the phone." in text
 
 
+def test_video_stage_generates_stills_and_builds_video_without_footage(tmp_path):
+    """Topic in, video out, no footage: generation is attempted once.
+
+    Network-dependent by design: if Pollinations answers, a real
+    video.mp4 must exist and the stage file must say AI stills +
+    motion. If the network fails, the suite must still pass — the
+    stage file must then record the honest per-scene failure and no
+    video may exist. Either outcome is asserted, never faked.
+    """
+    import os as _os
+
+    old_timeout = _os.environ.get("CREATOR_OS_GEN_TIMEOUT")
+    old_retry = _os.environ.get("CREATOR_OS_GEN_RETRY_TIMEOUT")
+    _os.environ["CREATOR_OS_GEN_TIMEOUT"] = "45"
+    _os.environ["CREATOR_OS_GEN_RETRY_TIMEOUT"] = "30"
+    try:
+        out_dir = tmp_path / "out"
+        code = run_pipeline([
+            "--topic", "AI receptionist for plumbers",
+            "--format", "short video",
+            "--niche", "US home-service owners",
+            "--audience", "plumbers who miss calls on the job",
+            "--out", str(out_dir),
+        ])
+    finally:
+        if old_timeout is None:
+            _os.environ.pop("CREATOR_OS_GEN_TIMEOUT", None)
+        else:
+            _os.environ["CREATOR_OS_GEN_TIMEOUT"] = old_timeout
+        if old_retry is None:
+            _os.environ.pop("CREATOR_OS_GEN_RETRY_TIMEOUT", None)
+        else:
+            _os.environ["CREATOR_OS_GEN_RETRY_TIMEOUT"] = old_retry
+    assert code == 0
+    text = (out_dir / "04-video.md").read_text(encoding="utf-8")
+    assert "Pollinations" in text, "stage file must name the image source"
+    assert "AI-generated stills + motion" in text
+    video = out_dir / "video.mp4"
+    if "## Built" in text:
+        assert video.exists(), "stage file claims Built but no video.mp4"
+        assert video.stat().st_size > 10000, "video.mp4 suspiciously small"
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,width,height",
+             "-show_entries", "format=duration",
+             "-of", "json", str(video)],
+            capture_output=True, text=True, timeout=60)
+        assert probe.returncode == 0, probe.stderr
+        import json as _json
+        data = _json.loads(probe.stdout)
+        kinds = [s.get("codec_type") for s in data.get("streams", [])]
+        assert "video" in kinds, f"no video stream: {data}"
+        assert float(data["format"]["duration"]) > 0
+        vstream = next(s for s in data["streams"]
+                       if s.get("codec_type") == "video")
+        assert (vstream.get("width"), vstream.get("height")) == (1080, 1920)
+        stills = list((out_dir / "video_work" / "stills").glob("*.jpg"))
+        assert len(stills) >= 1, "no generated stills on disk"
+        assert "No video was built" not in text
+    else:
+        assert "No video was built" in text
+        assert not video.exists(), "no video may exist on a failed build"
+        assert "generation failed" in text.lower(), (
+            "a failed build must record the generation failure")
+
+
 def test_no_network_code_in_src_and_scripts():
     banned = ["urllib", "requests", "http.client", "socket", "httpx",
               "aiohttp"]
+    # The single documented exception: scripts/gen_visuals.py calls the
+    # free Pollinations image service (no key). Everything else in
+    # src/, scripts/, and tests/ makes no network calls.
+    allowed = {ROOT / "scripts" / "gen_visuals.py"}
     for base in (ROOT / "src", ROOT / "scripts", ROOT / "tests"):
         for path in base.rglob("*.py"):
             if path.name == Path(__file__).name:
                 continue  # this test file names the banned words itself
+            if path in allowed:
+                continue  # the one documented network module
             text = path.read_text(encoding="utf-8")
             for word in banned:
                 assert word not in text, f"{path}: network token '{word}'"
+
+
+def test_gen_visuals_is_the_only_network_module():
+    """No other .py file may call the network: no Pollinations endpoint,
+    no curl invocation. (Naming the service in labels/docstrings is
+    fine — the call itself lives only in gen_visuals.py.)"""
+    for base in (ROOT / "src", ROOT / "scripts", ROOT / "tests"):
+        for path in base.rglob("*.py"):
+            if path.name == Path(__file__).name:
+                continue  # this test file names them itself
+            if path == ROOT / "scripts" / "gen_visuals.py":
+                continue
+            text = path.read_text(encoding="utf-8")
+            assert "pollinations.ai" not in text.lower(), (
+                f"{path} calls the Pollinations endpoint")
+            assert '"curl"' not in text and "'curl'" not in text, (
+                f"{path} invokes curl")
 
 
 def test_youtube_tools_still_run_standalone():
