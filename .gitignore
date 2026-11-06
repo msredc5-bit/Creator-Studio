@@ -1,0 +1,10 @@
+# generated output
+out/
+# python
+__pycache__/
+*.pyc
+*.pyo
+# local data / secrets
+*.db
+.venv/
+.env
