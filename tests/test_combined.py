@@ -27,10 +27,11 @@ STAGE_FILES = [
     "01-research.md",
     "02-script.md",
     "03-visual-package.md",
-    "04-edit.md",
-    "05-caption-seo.md",
-    "06-publish-prep.md",
-    "07-report.md",
+    "04-video.md",
+    "05-edit.md",
+    "06-caption-seo.md",
+    "07-publish-prep.md",
+    "08-report.md",
 ]
 
 
@@ -90,7 +91,7 @@ def test_no_stage_claims_a_publish_or_send(tmp_path):
         text = (out_dir / name).read_text(encoding="utf-8").lower()
         for phrase in banned:
             assert phrase not in text, f"{name} claims: {phrase}"
-    prep = (out_dir / "06-publish-prep.md").read_text(encoding="utf-8")
+    prep = (out_dir / "07-publish-prep.md").read_text(encoding="utf-8")
     assert "ready_to_publish: false" in prep
     assert "post it" in prep or "upload it" in prep
 
@@ -113,16 +114,72 @@ def test_title_lint_actually_ran(tmp_path):
 
 def test_edit_stage_skipped_honestly_without_transcript(tmp_path):
     out_dir = _run_mock_pipeline(tmp_path)
-    text = (out_dir / "04-edit.md").read_text(encoding="utf-8")
+    text = (out_dir / "05-edit.md").read_text(encoding="utf-8")
     assert "No transcript supplied" in text
     assert "skipped honestly" in text
 
 
 def test_retention_stage_skipped_honestly_without_export(tmp_path):
     out_dir = _run_mock_pipeline(tmp_path)
-    text = (out_dir / "07-report.md").read_text(encoding="utf-8")
+    text = (out_dir / "08-report.md").read_text(encoding="utf-8")
     assert "No retention export supplied" in text
     assert "never estimated" in text
+
+
+def test_video_stage_without_footage_states_missing_inputs(tmp_path):
+    out_dir = _run_mock_pipeline(tmp_path)
+    text = (out_dir / "04-video.md").read_text(encoding="utf-8")
+    assert "No video was built" in text
+    assert "Missing inputs" in text
+    assert "--footage" in text
+    assert "a real worker working" in text
+    assert not (out_dir / "video.mp4").exists()
+
+
+def test_video_stage_builds_real_mp4_with_footage(tmp_path):
+    import json as _json
+
+    clip = tmp_path / "test-footage.mp4"
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i",
+         "testsrc=duration=12:size=640x360:rate=30",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip)],
+        capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert clip.exists()
+    out_dir = tmp_path / "out"
+    code = run_pipeline([
+        "--topic", "AI receptionist for plumbers",
+        "--format", "short video",
+        "--niche", "US home-service owners",
+        "--audience", "plumbers who miss calls on the job",
+        "--footage", str(clip),
+        "--out", str(out_dir),
+    ])
+    assert code == 0
+    video = out_dir / "video.mp4"
+    assert video.exists(), "video.mp4 was not built"
+    assert video.stat().st_size > 10000, "video.mp4 suspiciously small"
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,width,height",
+         "-show_entries", "format=duration",
+         "-of", "json", str(video)],
+        capture_output=True, text=True, timeout=60)
+    assert probe.returncode == 0, probe.stderr
+    data = _json.loads(probe.stdout)
+    kinds = [s.get("codec_type") for s in data.get("streams", [])]
+    assert "video" in kinds, f"no video stream: {data}"
+    assert float(data["format"]["duration"]) > 0
+    vstream = next(s for s in data["streams"]
+                   if s.get("codec_type") == "video")
+    assert (vstream.get("width"), vstream.get("height")) == (1080, 1920)
+    text = (out_dir / "04-video.md").read_text(encoding="utf-8")
+    assert "Built" in text
+    assert "video.mp4" in text
+    assert "No video was built" not in text
+    assert "Scene 1" in text
+    assert "You run the jobs. We run the phone." in text
 
 
 def test_no_network_code_in_src_and_scripts():

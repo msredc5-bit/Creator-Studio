@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Creator OS — combined pipeline runner (mock mode, $0).
 
-One idea in, eight stage drafts out. Each stage runs the Creator
+One idea in, nine stage drafts out. Each stage runs the Creator
 Studio worker AND the matching YouTube skill/tool where one exists:
 
   0. Plan         — yt-plan (weekly plan, from hours available)
   1. Research     — TopicResearcher + yt-viral swipe.py
   2. Script       — ScriptWriter + yt-script hookscore.py (21 formulas)
   3. Visual+Pack  — VisualProducer + yt-package title.py (title+thumb)
-  4. Edit         — yt-edit deadair.py + yt-chapters chapters.py
+  4. Video        — Reel Factory build (real footage + TTS + captions
+                    + exact-logo end card; without --footage it writes
+                    the production plan + the exact missing inputs and
+                    builds no video)
+  5. Edit         — yt-edit deadair.py + yt-chapters chapters.py
                     + yt-shorts (needs --transcript, else skipped honestly)
-  5. Caption+SEO  — CaptionWriter + yt-seo (description/tags)
-  6. Publish prep — PublishPrep ONLY (prepare, never publish)
-  7. Report       — PerformanceTracker + yt-retention retention.py
+  6. Caption+SEO  — CaptionWriter + yt-seo (description/tags)
+  7. Publish prep — PublishPrep ONLY (prepare, never publish)
+  8. Report       — PerformanceTracker + yt-retention retention.py
                     (+ yt-audit, yt-comment — post-publish only)
 
 Usage:
@@ -20,12 +24,15 @@ Usage:
       --format "short video" [--niche ...] [--audience ...]
       [--transcript transcript.srt] [--retention retention.csv]
       [--collected collected.json] [--hours 6] [--out out/dir]
+      [--footage footage.mp4] [--voice avocado_v2:MAI_01]
 
 Mock mode is the DEFAULT: the workers draft through MockLLM (offline,
 deterministic, $0) and the YouTube tools are local Python with no
-network and no keys. Nothing here publishes, sends, uploads, schedules,
-spends, or touches media. The run ends with "ship it, or change it?"
-and exits — the owner publishes, if at all, with their own word.
+network and no keys. The video stage builds a local mp4 only when
+footage is supplied (FFmpeg + the local `tts` binary, $0). Nothing
+here publishes, sends, uploads, schedules, or spends. The run ends
+with "ship it, or change it?" and exits — the owner publishes, if at
+all, with their own word.
 """
 from __future__ import annotations
 
@@ -49,6 +56,7 @@ from src.creator_workers import (  # noqa: E402
     VisualProducer,
 )
 from src.workers.base import MockLLM, Task  # noqa: E402
+from scripts.video_build import build_video  # noqa: E402
 
 SKILLS = ROOT / "youtube-skills"
 FORMATS = ["short video", "long video", "carousel", "image", "blog",
@@ -148,7 +156,7 @@ def stage_plan(args, out_dir: Path) -> Path:
         "a clip, a follow-up, or the comment that got the most replies "
         "last week.\n"
         "- **Three Shorts.** Pick from the anchor's strongest moments "
-        "after filming (see stage 4, yt-shorts) — not invented here.\n\n"
+        "after filming (see stage 5, yt-shorts) — not invented here.\n\n"
         "Best day to post: your own analytics say — ask, do not assume. "
         "No day is guessed here.\n\n"
         "## What is still needed\n\n"
@@ -262,8 +270,81 @@ def stage_visual(args, out_dir: Path, llm: MockLLM) -> Path:
     return write_stage(out_dir, "03-visual-package.md", text)
 
 
+def stage_video(args, out_dir: Path) -> Path:
+    # The header is written by hand here: the video stage is a local
+    # build (FFmpeg + the tts binary), not a mock draft, so the generic
+    # "no network" line in stage_header would not be honest about TTS
+    # (the tts binary synthesises through its own service; this repo
+    # itself makes no network calls).
+    result = build_video(args, out_dir, out_dir / "video_work")
+    text = ("# Stage 4 — Video (Reel Factory)\n\n"
+            "Sources: Reel Factory build — real footage + TTS voiceover "
+            "+ burned-in captions + exact-logo end card\n"
+            "Mode: local build (FFmpeg + tts binary, $0). "
+            f"{GATE_NOTE}\nGate: `upload it`\n\n---\n")
+    plan = result["plan"]
+    if result["built"]:
+        text += (f"## Built\n\n- Output: `{result['video_path']}`\n"
+                 f"- Duration: {result['duration']}s, "
+                 f"{result['width']}x{result['height']} 30fps, "
+                 f"H.264 + {result.get('audio', '')}, faststart\n"
+                 f"- Size: {result['size_bytes']} bytes\n"
+                 "- Verified: ffprobe reads the video stream and the "
+                 "file decodes cleanly (ffmpeg -f null).\n\n")
+    else:
+        text += (f"## No video was built\n\n{result['reason']}.\n\n")
+    if result["missing"]:
+        text += "## Missing inputs — needed from Boss\n\n"
+        for item in result["missing"]:
+            text += f"- {item}\n"
+        text += "\n"
+    text += "## Production plan (shot list)\n\n"
+    for scene in plan.get("scenes", []):
+        text += (f"- Scene {scene['scene']} ({scene['seconds']}): "
+                 f"{scene['shows']}\n"
+                 f"  Voiceover: \"{scene['vo_line']}\"\n")
+    text += ("\nCaptions: " + plan.get("captions", "") +
+             " (line-level, not word-level karaoke).\n"
+             f"Voice: {plan.get('voice', '')} "
+             "(override with --voice).\n\n")
+    endcard = plan.get("endcard", {})
+    text += ("## End card\n\n"
+             f"- Duration: {endcard.get('duration_s')}s\n"
+             f"- Logo: exact file `{endcard.get('logo')}` — pasted flat, "
+             "never redrawn\n"
+             f"- Headline: \"{endcard.get('headline')}\"\n"
+             f"- CTA: \"{endcard.get('cta')}\"\n")
+    if result["built"]:
+        text += "\n## What was used\n\n"
+        for scene in result["scenes"]:
+            text += (f"- Scene {scene['scene']}: "
+                     f"{scene['footage']}, "
+                     f"voiceover {'spoken' if scene['vo_ok'] else 'SILENT (TTS failed)'} — "
+                     f"\"{scene['vo_line']}\"\n")
+        end = result.get("endcard", {})
+        if end.get("logo_used"):
+            end_note = (f"{end.get('duration')}s, exact logo "
+                        f"({end.get('note')})")
+        else:
+            end_note = (f"{end.get('duration')}s, TEXT-ONLY "
+                        f"({end.get('note')})")
+        text += f"- End card: {end_note}\n"
+        if result["fallbacks"]:
+            text += "\n## Fallbacks (read before shipping)\n\n"
+            for fb in result["fallbacks"]:
+                text += f"- {fb}\n"
+    text += ("\n## Limits\n\n"
+             "- No AI text-to-video generation exists here "
+             "(region-blocked) — footage-based assembly only.\n"
+             "- Voiceover lines are templated from the brand pitch; "
+             "rewrite them before shipping.\n"
+             "- This file is a build record, not an upload. Gate: "
+             "`upload it` — the owner uploads, if at all.\n")
+    return write_stage(out_dir, "04-video.md", text)
+
+
 def stage_edit(args, out_dir: Path) -> Path:
-    text = stage_header(4, "Edit",
+    text = stage_header(5, "Edit",
                         "yt-edit deadair.py + yt-chapters chapters.py "
                         "+ yt-shorts (no scoring tool)", "ok")
     if not args.transcript:
@@ -273,7 +354,7 @@ def stage_edit(args, out_dir: Path) -> Path:
                  ".vtt, or whisper .json) and re-run with "
                  "--transcript transcript.srt. The tools print an edit "
                  "decision list; they never cut media themselves.\n")
-        return write_stage(out_dir, "04-edit.md", text)
+        return write_stage(out_dir, "05-edit.md", text)
     text += f"Transcript: {args.transcript}\n\n"
     ok, out = run_tool(SKILLS / "yt-edit" / "deadair.py",
                        [args.transcript, "--json"])
@@ -315,14 +396,14 @@ def stage_edit(args, out_dir: Path) -> Path:
              "have a turn, and end on a line (yt-shorts SKILL.md). "
              "Score each candidate's new first line with hookscore.py "
              "before keeping it.\n")
-    return write_stage(out_dir, "04-edit.md", text)
+    return write_stage(out_dir, "05-edit.md", text)
 
 
 def stage_caption(args, out_dir: Path, llm: MockLLM) -> Path:
     result = run_worker(CaptionWriter, {"topic": args.topic}, llm)
     hook = args.hook or derive_hook(args.topic)
     tags = derive_tags(args.topic)
-    text = stage_header(5, "Caption + SEO",
+    text = stage_header(6, "Caption + SEO",
                         "CaptionWriter + yt-seo (no scoring tool — "
                         "written draft, per the skill)", "ok")
     text += "## Caption pack (worker draft)\n\n" + result.notes + "\n\n"
@@ -330,7 +411,7 @@ def stage_caption(args, out_dir: Path, llm: MockLLM) -> Path:
              f"{hook}\n"
              f"This video covers: {args.topic}.\n\n"
              "[ADD YOUR LINK HERE — nothing invented.]\n\n"
-             "Chapters: [ADD FROM STAGE 4 — only if a transcript was "
+             "Chapters: [ADD FROM STAGE 5 — only if a transcript was "
              "supplied.]\n\n"
              f"Who it is for: {args.audience or '[not given — say who '
              'this is for]'}. What it assumes: nothing — plain words, "
@@ -338,13 +419,13 @@ def stage_caption(args, out_dir: Path, llm: MockLLM) -> Path:
              "## Tags (draft — from the topic words only)\n\n" +
              (", ".join(tags) if tags else "[no usable words in the "
               "topic — add tags by hand]") + "\n")
-    return write_stage(out_dir, "05-caption-seo.md", text)
+    return write_stage(out_dir, "06-caption-seo.md", text)
 
 
 def stage_publish(args, out_dir: Path, llm: MockLLM) -> Path:
     result = run_worker(PublishPrep, {"topic": args.topic}, llm)
     gate = "upload it" if "video" in args.format else "post it"
-    text = stage_header(6, "Publish prep",
+    text = stage_header(7, "Publish prep",
                         "PublishPrep ONLY — prepare, never publish", gate)
     text += result.notes + "\n\n"
     text += ("## Gate\n\n"
@@ -353,12 +434,12 @@ def stage_publish(args, out_dir: Path, llm: MockLLM) -> Path:
              "run uploads, posts, schedules, or sends anything. The "
              "owner publishes with their exact word — "
              f"`{gate}` — or not at all.\n")
-    return write_stage(out_dir, "06-publish-prep.md", text)
+    return write_stage(out_dir, "07-publish-prep.md", text)
 
 
 def stage_report(args, out_dir: Path, llm: MockLLM) -> Path:
     result = run_worker(PerformanceTracker, {"topic": args.topic}, llm)
-    text = stage_header(7, "Report",
+    text = stage_header(8, "Report",
                         "PerformanceTracker + yt-retention retention.py "
                         "(+ yt-audit, yt-comment — post-publish only)",
                         "ok")
@@ -407,7 +488,7 @@ def stage_report(args, out_dir: Path, llm: MockLLM) -> Path:
              "- yt-comment: there are no comments yet — nothing to "
              "triage or draft. After publishing, triage into the "
              "skill's four piles and draft replies in your voice.\n")
-    return write_stage(out_dir, "07-report.md", text)
+    return write_stage(out_dir, "08-report.md", text)
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +497,7 @@ def stage_report(args, out_dir: Path, llm: MockLLM) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Creator OS combined pipeline — mock mode, $0. "
-                    "Writes 8 stage drafts and stops. Never publishes.")
+                    "Writes 9 stage drafts and stops. Never publishes.")
     ap.add_argument("--topic", required=True,
                     help="The one idea this run is about.")
     ap.add_argument("--format", default="short video", choices=FORMATS,
@@ -441,6 +522,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Collected videos JSON for yt-viral swipe.py.")
     ap.add_argument("--out", default="",
                     help="Output dir (default: out/<slug>-<YYYY-MM-DD>/).")
+    ap.add_argument("--footage", default="",
+                    help="Video file or folder of clips for the video stage.")
+    ap.add_argument("--voice", default="avocado_v2:MAI_01",
+                    help="TTS voice id for the video stage voiceover.")
+    ap.add_argument("--no-video", action="store_true",
+                    help="Skip building a video (stage 4 still writes its plan).")
     return ap
 
 
@@ -460,6 +547,7 @@ def main(argv=None) -> int:
         ("Research", lambda: stage_research(args, out_dir, llm)),
         ("Script", lambda: stage_script(args, out_dir, llm)),
         ("Visual + Package", lambda: stage_visual(args, out_dir, llm)),
+        ("Video", lambda: stage_video(args, out_dir)),
         ("Edit", lambda: stage_edit(args, out_dir)),
         ("Caption + SEO", lambda: stage_caption(args, out_dir, llm)),
         ("Publish prep", lambda: stage_publish(args, out_dir, llm)),
@@ -471,7 +559,7 @@ def main(argv=None) -> int:
         written.append(path)
         print(f"  [ok] stage {len(written) - 1}: {name} -> {path.name}")
 
-    print(f"\n{len(written)}/8 stage drafts written to {out_dir}")
+    print(f"\n{len(written)}/9 stage drafts written to {out_dir}")
     print(f"mock LLM calls: {llm.calls} | spend: $0.00")
     print("Nothing was published, sent, uploaded, or scheduled.")
     print("\nship it, or change it?")
