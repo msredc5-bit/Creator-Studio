@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.creator_workers import PublishPrep, ROSTER  # noqa: E402
 from src.workers.base import MockLLM, Task  # noqa: E402
+from scripts import video_providers as vp  # noqa: E402
 from scripts.creator_os_run import main as run_pipeline  # noqa: E402
 
 ALLOWED_GATES = {"ok", "post it", "upload it", "send", "go", None}
@@ -226,6 +227,8 @@ def test_video_stage_generates_stills_and_builds_video_without_footage(tmp_path)
     text = (out_dir / "04-video.md").read_text(encoding="utf-8")
     assert "Pollinations" in text, "stage file must name the image source"
     assert "AI-generated stills + motion" in text
+    assert "Provider: `stills`" in text, (
+        "stage file must record the resolved video provider")
     video = out_dir / "video.mp4"
     if "## Built" in text:
         assert video.exists(), "stage file claims Built but no video.mp4"
@@ -258,10 +261,13 @@ def test_video_stage_generates_stills_and_builds_video_without_footage(tmp_path)
 def test_no_network_code_in_src_and_scripts():
     banned = ["urllib", "requests", "http.client", "socket", "httpx",
               "aiohttp"]
-    # The single documented exception: scripts/gen_visuals.py calls the
-    # free Pollinations image service (no key). Everything else in
-    # src/, scripts/, and tests/ makes no network calls.
-    allowed = {ROOT / "scripts" / "gen_visuals.py"}
+    # The two documented exceptions: scripts/gen_visuals.py calls the
+    # free Pollinations image service (no key), and
+    # scripts/video_providers.py calls a paid video API only when the
+    # user configures the api provider with their own key. Everything
+    # else in src/, scripts/, and tests/ makes no network calls.
+    allowed = {ROOT / "scripts" / "gen_visuals.py",
+               ROOT / "scripts" / "video_providers.py"}
     for base in (ROOT / "src", ROOT / "scripts", ROOT / "tests"):
         for path in base.rglob("*.py"):
             if path.name == Path(__file__).name:
@@ -273,21 +279,28 @@ def test_no_network_code_in_src_and_scripts():
                 assert word not in text, f"{path}: network token '{word}'"
 
 
-def test_gen_visuals_is_the_only_network_module():
-    """No other .py file may call the network: no Pollinations endpoint,
-    no curl invocation. (Naming the service in labels/docstrings is
-    fine — the call itself lives only in gen_visuals.py.)"""
+def test_network_calls_only_in_documented_modules():
+    """No .py file may call the network except the two documented
+    ones: gen_visuals.py (free Pollinations images, no key) and
+    video_providers.py (paid video API, only when the user configures
+    the api provider with their own key). (Naming the services in
+    labels/docstrings is fine — the call itself lives only in those
+    two files.)"""
+    allowed = {ROOT / "scripts" / "gen_visuals.py",
+               ROOT / "scripts" / "video_providers.py"}
     for base in (ROOT / "src", ROOT / "scripts", ROOT / "tests"):
         for path in base.rglob("*.py"):
             if path.name == Path(__file__).name:
                 continue  # this test file names them itself
-            if path == ROOT / "scripts" / "gen_visuals.py":
+            if path in allowed:
                 continue
             text = path.read_text(encoding="utf-8")
             assert "pollinations.ai" not in text.lower(), (
                 f"{path} calls the Pollinations endpoint")
             assert '"curl"' not in text and "'curl'" not in text, (
                 f"{path} invokes curl")
+            assert "api.muapi.ai" not in text.lower(), (
+                f"{path} calls the Muapi endpoint")
 
 
 def test_youtube_tools_still_run_standalone():
@@ -300,6 +313,275 @@ def test_youtube_tools_still_run_standalone():
     import json
     rows = json.loads(proc.stdout)
     assert rows and "verdict" in rows[0]
+
+
+# ---------------------------------------------------------------------------
+# video providers (scripts/video_providers.py)
+# ---------------------------------------------------------------------------
+def _provider_args(**overrides):
+    import argparse
+    args = argparse.Namespace(
+        footage="", gen_visuals=True, video_provider=None,
+        video_config="", format="short video",
+        voice="avocado_v2:MAI_01")
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _provider_ctx(tmp_path, fmt="short video"):
+    work = tmp_path / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    width, height = (1080, 1920) if fmt == "short video" else (1920, 1080)
+    return {
+        "args": _provider_args(format=fmt), "work": work,
+        "width": width, "height": height,
+        "scene_count": 3, "cap": 30.0 if fmt == "short video" else 90.0,
+        "scenes": vp.scene_prompts(), "format": fmt,
+    }
+
+
+def test_provider_config_defaults():
+    cfg, errors = vp.resolve(_provider_args())
+    assert errors == [], errors
+    assert cfg.provider == "auto"
+    assert cfg.fallback is None
+    assert cfg.local_engine == "wangp"
+    assert cfg.api_url.startswith("https://api.muapi.ai/")
+    assert cfg.api_key_env == "VIDEO_API_KEY"
+
+
+def test_provider_config_bad_name():
+    import pytest
+    with pytest.raises(ValueError, match="unknown video provider"):
+        vp.parse_config_text("provider: bogus\n")
+    with pytest.raises(ValueError, match="unknown local engine"):
+        vp.parse_config_text("local:\n  engine: nope\n")
+    with pytest.raises(ValueError, match="unknown key"):
+        vp.parse_config_text("provider: auto\ntypo_key: 1\n")
+    with pytest.raises(ValueError, match="unknown fallback"):
+        vp.parse_config_text("provider: stills\nfallback: bogus\n")
+
+
+def test_provider_routing_flags_and_env(monkeypatch):
+    cfg, errors = vp.resolve(_provider_args(video_provider="local"))
+    assert errors == []
+    assert cfg.provider == "local"
+    monkeypatch.setenv("VIDEO_PROVIDER", "api")
+    cfg_env, errors = vp.resolve(_provider_args())
+    assert errors == []
+    assert cfg_env.provider == "api"
+    # flag wins over env
+    cfg, errors = vp.resolve(_provider_args(video_provider="stills"))
+    assert cfg.provider == "stills"
+    # footage wins when given, whatever the config says
+    assert vp.resolve_provider(_provider_args(footage="clip.mp4"),
+                               cfg) == "footage"
+    assert vp.resolve_provider(_provider_args(), cfg_env) == "api"
+    # with no env var and no flag, the repo config (auto) resolves
+    # to the stills default
+    monkeypatch.delenv("VIDEO_PROVIDER")
+    cfg2, _ = vp.resolve(_provider_args())
+    assert vp.resolve_provider(_provider_args(), cfg2) == "stills"
+
+
+def test_provider_config_file_loads(tmp_path):
+    cfg_file = tmp_path / "video_providers.yaml"
+    cfg_file.write_text(
+        "provider: local\n"
+        "fallback: stills\n"
+        "local:\n"
+        "  engine: custom\n"
+        "  command: python3 gen.py --out \"{output}\"\n"
+        "  timeout: 300\n"
+        "api:\n"
+        "  model: openai-sora-2-pro-text-to-video\n",
+        encoding="utf-8")
+    cfg = vp.load_config(cfg_file)
+    assert cfg.provider == "local"
+    assert cfg.fallback == "stills"
+    assert cfg.local_engine == "custom"
+    assert "{output}" in cfg.local_cmd
+    assert cfg.local_timeout == 300
+    assert cfg.api_model == "openai-sora-2-pro-text-to-video"
+
+
+def test_local_provider_mock_command(tmp_path):
+    # Fake local generator: a tiny script that writes a real testsrc
+    # clip to {output}. Exercises the adapter wiring, no GPU needed.
+    script = tmp_path / "fake_gen.py"
+    script.write_text(
+        "import argparse, subprocess, sys\n"
+        "ap = argparse.ArgumentParser()\n"
+        "ap.add_argument('--out', required=True)\n"
+        "ap.add_argument('--prompt', default='')\n"
+        "a = ap.parse_args()\n"
+        "p = subprocess.run(['ffmpeg', '-y', '-f', 'lavfi', '-i',\n"
+        "    'testsrc=duration=6:size=640x360:rate=30', '-c:v',\n"
+        "    'libx264', '-pix_fmt', 'yuv420p', a.out],\n"
+        "    capture_output=True, text=True, timeout=120)\n"
+        "sys.exit(p.returncode)\n",
+        encoding="utf-8")
+    cfg = vp.ProviderConfig(
+        provider="local", local_engine="custom",
+        local_cmd=f"{sys.executable} {script} --prompt \"{{prompt}}\" "
+                  f"--out \"{{output}}\"",
+        local_timeout=120)
+    provider = vp.LocalProvider(cfg,
+                                gpu_probe=lambda: (True, "fake GPU"))
+    result = provider.generate(_provider_ctx(tmp_path))
+    assert result["cut_path"] is not None, result
+    assert Path(result["cut_path"]).exists()
+    assert all(r["ok"] for r in result["provider_scenes"])
+    assert result["scene_dur"] == 5.0
+    assert result["used"] == 15.0
+    assert "local video" in result["source"]
+
+
+def test_local_provider_no_gpu_fails_honestly(tmp_path):
+    cfg = vp.ProviderConfig(provider="local", local_engine="wangp",
+                            local_wangp_dir=str(tmp_path))
+    provider = vp.LocalProvider(
+        cfg, gpu_probe=lambda: (False, "nvidia-smi not found"))
+    result = provider.generate(_provider_ctx(tmp_path))
+    assert result["cut_path"] is None
+    assert "GPU" in result["reason"]
+    assert any("GPU" in m for m in result["missing"])
+
+
+def test_local_provider_no_command_fails_honestly(tmp_path):
+    cfg = vp.ProviderConfig(provider="local", local_engine="framepack")
+    provider = vp.LocalProvider(
+        cfg, gpu_probe=lambda: (True, "fake GPU"))
+    result = provider.generate(_provider_ctx(tmp_path))
+    assert result["cut_path"] is None
+    assert "no command configured" in result["reason"]
+    assert "UNVERIFIED" in " ".join(result["missing"])
+
+
+def test_api_provider_missing_key_fails_honestly(tmp_path, monkeypatch):
+    monkeypatch.delenv("VIDEO_API_KEY", raising=False)
+    cfg = vp.ProviderConfig(provider="api")
+    result = vp.ApiProvider(cfg).generate(_provider_ctx(tmp_path))
+    assert result["cut_path"] is None
+    assert "VIDEO_API_KEY" in result["reason"] or any(
+        "VIDEO_API_KEY" in m for m in result["missing"])
+
+
+def test_api_provider_mock_server(tmp_path, monkeypatch):
+    # Fake Muapi-like server: submit -> request_id, poll -> completed
+    # with a clip URL, clip served from disk. No real API, no key.
+    import http.server
+    import json as _json
+    import threading
+
+    clip = tmp_path / "server-clip.mp4"
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i",
+         "testsrc=duration=6:size=640x360:rate=30",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip)],
+        capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    clip_bytes = clip.read_bytes()
+    seen = {"bodies": [], "keys": [], "polls": 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send_json(self, obj):
+            data = _json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            seen["bodies"].append(self.rfile.read(length))
+            seen["keys"].append(self.headers.get("x-api-key"))
+            self._send_json({"request_id": "req-123"})
+
+        def do_GET(self):
+            if self.path.endswith("/result"):
+                seen["polls"] += 1
+                if seen["polls"] % 2 == 1:
+                    self._send_json({"status": "processing"})
+                else:
+                    port = self.server.server_address[1]
+                    self._send_json({
+                        "status": "completed",
+                        "outputs": [{"url":
+                                     f"http://127.0.0.1:{port}/clip.mp4"}]})
+            elif self.path.endswith("/clip.mp4"):
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(len(clip_bytes)))
+                self.end_headers()
+                self.wfile.write(clip_bytes)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        monkeypatch.setenv("VIDEO_API_KEY", "fake-key-123")
+        cfg = vp.ProviderConfig(
+            provider="api",
+            api_url=f"http://127.0.0.1:{port}/submit",
+            api_poll_url=f"http://127.0.0.1:{port}/predictions/"
+                         "{request_id}/result",
+            api_poll_interval=1, api_timeout=60)
+        result = vp.ApiProvider(cfg).generate(_provider_ctx(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result["cut_path"] is not None, result
+    assert all(r["ok"] for r in result["provider_scenes"])
+    assert seen["keys"] == ["fake-key-123"] * 3
+    bodies = [_json.loads(b) for b in seen["bodies"]]
+    assert len(bodies) == 3
+    assert all("prompt" in b for b in bodies)
+    assert all(b.get("aspect_ratio") == "9:16" for b in bodies)
+
+
+def test_pipeline_local_provider_fails_honestly(tmp_path):
+    out_dir = tmp_path / "out"
+    code = run_pipeline([
+        "--topic", "AI receptionist for plumbers",
+        "--format", "short video",
+        "--video-provider", "local",
+        "--out", str(out_dir),
+    ])
+    assert code == 0
+    text = (out_dir / "04-video.md").read_text(encoding="utf-8")
+    assert "No video was built" in text
+    assert "GPU" in text
+    assert "local" in text.lower()
+    assert not (out_dir / "video.mp4").exists()
+
+
+def test_pipeline_bad_provider_in_config(tmp_path):
+    cfg_file = tmp_path / "video_providers.yaml"
+    cfg_file.write_text("provider: bogus\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+    code = run_pipeline([
+        "--topic", "AI receptionist for plumbers",
+        "--format", "short video",
+        "--video-config", str(cfg_file),
+        "--no-gen-visuals",
+        "--out", str(out_dir),
+    ])
+    assert code == 0
+    text = (out_dir / "04-video.md").read_text(encoding="utf-8")
+    assert "No video was built" in text
+    assert "unknown video provider 'bogus'" in text
+    assert "configuration error" in text
+    assert not (out_dir / "video.mp4").exists()
 
 
 def _main() -> int:

@@ -8,9 +8,13 @@ Studio worker AND the matching YouTube skill/tool where one exists:
   1. Research     — TopicResearcher + yt-viral swipe.py
   2. Script       — ScriptWriter + yt-script hookscore.py (21 formulas)
   3. Visual+Pack  — VisualProducer + yt-package title.py (title+thumb)
-  4. Video        — Reel Factory build: real footage when --footage
-                    is given, otherwise AI-generated stills
-                    (Pollinations, free) + slow Ken Burns motion.
+  4. Video        — Reel Factory build through a pluggable video
+                    provider (see README.md "Video providers"): real
+                    footage when --footage is given, otherwise the
+                    configured provider — AI-generated stills
+                    (Pollinations, free) + slow Ken Burns motion by
+                    default, or true AI video motion from a local
+                    model (your GPU) or a paid cloud API (your key).
                     With --no-gen-visuals and no footage it writes
                     the production plan + the exact missing inputs
                     and builds no video.
@@ -28,15 +32,20 @@ Usage:
       [--collected collected.json] [--hours 6] [--out out/dir]
       [--footage footage.mp4] [--voice avocado_v2:MAI_01]
       [--gen-visuals | --no-gen-visuals]
+      [--video-provider {footage|stills|local|api|auto}]
+      [--video-config video_providers.yaml]
 
 Mock mode is the DEFAULT: the workers draft through MockLLM (offline,
 deterministic, $0) and the YouTube tools are local Python with no
 network and no keys. The video stage builds a local mp4 from real
-footage when supplied, otherwise from AI-generated stills
-(Pollinations, free — the ONLY network call in this repo, see
-scripts/gen_visuals.py). Nothing here publishes, sends, uploads,
-schedules, or spends. The run ends with "ship it, or change it?" and
-exits — the owner publishes, if at all, with their own word.
+footage when supplied, otherwise from the configured video provider
+(default: AI-generated stills — Pollinations, free; the network
+calls in this repo live only in scripts/gen_visuals.py and in the
+api provider of scripts/video_providers.py, which runs only when
+the user configures it with their own key). Nothing here publishes,
+sends, uploads, schedules, or spends. The run ends with "ship it, or
+change it?" and exits — the owner publishes, if at all, with their
+own word.
 """
 from __future__ import annotations
 
@@ -329,6 +338,14 @@ def stage_video(args, out_dir: Path) -> Path:
         text += ("\nAI stills + motion: the images are AI-generated "
                  "stills given slow zoom/pan motion. That is not real "
                  "footage and not true AI video motion.\n\n")
+    if result.get("provider"):
+        text += "## Video provider\n\n"
+        text += f"- Provider: `{result['provider']}`\n"
+        for rec in result.get("provider_scenes", []):
+            status = "OK" if rec.get("ok") else "FAILED"
+            text += (f"- Scene {rec.get('scene')}: {status} — "
+                     f"{rec.get('note')}\n")
+        text += "\n"
     text += "## Production plan (shot list)\n\n"
     for scene in plan.get("scenes", []):
         text += (f"- Scene {scene['scene']} ({scene['seconds']}): "
@@ -365,11 +382,13 @@ def stage_video(args, out_dir: Path) -> Path:
             for fb in result["fallbacks"]:
                 text += f"- {fb}\n"
     text += ("\n## Limits\n\n"
-             "- No true AI text-to-video generation exists here "
-             "(region-blocked). Without footage, the stage generates "
-             "AI stills (Pollinations, free) and gives them slow "
-             "Ken Burns motion — AI stills + motion, not real footage "
-             "and not true AI video motion.\n"
+             "- The $0 default visual source is AI stills (Pollinations, "
+             "free) with slow Ken Burns motion — AI stills + motion, "
+             "not real footage and not true AI video motion. True AI "
+             "video motion comes from the local provider (your own GPU: "
+             "WanGP/FramePack) or the api provider (your own paid key: "
+             "Muapi Sora/Runway) — see README.md 'Video providers'. "
+             "Neither a GPU nor a key is wired in here.\n"
              "- Voiceover lines are templated from the brand pitch; "
              "rewrite them before shipping.\n"
              "- This file is a build record, not an upload. Gate: "
@@ -558,6 +577,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Output dir (default: out/<slug>-<YYYY-MM-DD>/).")
     ap.add_argument("--footage", default="",
                     help="Video file or folder of clips for the video stage.")
+    ap.add_argument("--video-provider", default=None,
+                    choices=["footage", "stills", "local", "api", "auto"],
+                    help="Video provider: footage (needs --footage), "
+                         "stills (free default), local (your GPU: "
+                         "WanGP/FramePack/custom), api (your paid key: "
+                         "Muapi Sora/Runway), or auto (default: footage "
+                         "if given, else the configured provider, else "
+                         "stills).")
+    ap.add_argument("--video-config", default="",
+                    help="Video provider config file (default: "
+                         "video_providers.yaml at the repo root).")
     ap.add_argument("--gen-visuals", dest="gen_visuals",
                     action="store_true", default=True,
                     help="Generate AI stills when no --footage is given "

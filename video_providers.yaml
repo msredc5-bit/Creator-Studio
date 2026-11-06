@@ -1,0 +1,84 @@
+# Video providers — Creator OS video stage (stage 4).
+#
+# Pick which backend makes the visuals. Whoever has the hardware or
+# the paid key uses it; whoever doesn't gets a clear missing-input
+# list instead of a fake video. A provider is NEVER silently
+# swapped: if the chosen one fails and `fallback` is empty, the
+# stage records the failure honestly and builds no video.
+#
+# NO SECRETS IN THIS FILE. API keys live ONLY in environment
+# variables (VIDEO_API_KEY etc.) — never here, never committed.
+#
+# Precedence: --video-provider flag > VIDEO_PROVIDER env var >
+# this file > built-in default (auto -> stills).
+#
+# Valid providers: auto, footage, stills, local, api
+#   auto    — footage if --footage is given, else the provider
+#             named here (if any), else stills (the $0 default).
+#   footage — real footage from --footage. Preferred whenever given.
+#   stills  — AI stills (Pollinations, free, no key) + Ken Burns
+#             motion. Default. AI stills + motion — NOT true AI
+#             video motion and NOT real footage.
+#   local   — open-source video models on YOUR machine (WanGP,
+#             FramePack, or any command you configure). Needs a
+#             CUDA GPU. NOT VERIFIED on the build machine (no GPU).
+#   api     — paid cloud video via a generic HTTP adapter. Muapi is
+#             the documented example (Sora 2 / Runway, pay per
+#             request). NOT VERIFIED with a real paid call.
+provider: auto
+
+# Optional fallback, tried once if the chosen provider fails.
+# Empty (null) = fail honestly, no silent swap.
+# Example: fallback: stills
+fallback: null
+
+# Extra attempts per failed scene (0 = try once).
+retries: 1
+
+local:
+  # Engine: wangp | framepack | custom
+  engine: wangp
+  # Command template for the framepack/custom engines. Placeholders:
+  # {prompt} {image} {duration} {width} {height} {output}
+  # Env var LOCAL_VIDEO_CMD overrides this.
+  # Example (custom): python3 my-gen.py --prompt "{prompt}"
+  #   --seconds {duration} --width {width} --height {height}
+  #   --out "{output}"
+  command: ""
+  # WanGP checkout folder (contains wgp.py). Used by the wangp engine.
+  wangp_dir: ""
+  # WanGP saved queue (.zip) with one job per scene. Create it in
+  # the WanGP web UI (Save Queue). Used by the wangp engine.
+  queue: ""
+  # Folder the local engine writes finished clips to. Used by the
+  # wangp engine (clips are collected from here, newest first).
+  output_dir: ""
+  # Seconds allowed per local generation run (local models are slow).
+  timeout: 1800
+
+api:
+  # Submit endpoint. Env var VIDEO_API_URL overrides this.
+  # Default = Muapi Sora 2 standard text-to-video ($0.80/request
+  # per Muapi docs 2026-11-07; check the live pricing page — prices
+  # change). Other Muapi endpoints: openai-sora-2-pro-text-to-video
+  # ($2.40/request, up to 1080p), runway-text-to-video ($0.09),
+  # runway-image-to-video ($0.15).
+  url: https://api.muapi.ai/api/v1/openai-sora-2-text-to-video
+  # Poll endpoint. {request_id} is filled in from the submit reply.
+  poll_url: https://api.muapi.ai/api/v1/predictions/{request_id}/result
+  # Name of the environment variable holding the API key.
+  # The key itself is NEVER written here.
+  key_env: VIDEO_API_KEY
+  # Model name, recorded in the stage file. Env var VIDEO_MODEL
+  # overrides this. For Muapi the endpoint already names the model.
+  model: openai-sora-2-text-to-video
+  # Request body, as JSON. The adapter fills prompt, duration,
+  # resolution, and aspect_ratio per scene before sending — the
+  # values below are valid-JSON placeholders, not real requests.
+  # Default = the Muapi Sora shape, verified from muapi.ai/sora
+  # 2026-11-07. Other providers need their own body_json.
+  body_json: '{"prompt": "", "aspect_ratio": "16:9", "duration": 8, "resolution": "1080p"}'
+  # Seconds allowed per scene (submit + poll).
+  timeout: 900
+  # Seconds between polls.
+  poll_interval: 15

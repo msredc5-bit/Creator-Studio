@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Reel Factory video stage for Creator OS — footage OR generated stills.
+"""Reel Factory video stage for Creator OS — pluggable providers.
 
-Local tools only: FFmpeg + PIL + the `tts` binary, plus
-scripts/gen_visuals.py (the single network-calling module in this
-repo: free Pollinations image generation, no API key, $0). This
-module itself makes no network calls. $0 spend. Nothing publishes,
-sends, uploads, or schedules.
+Local tools only: FFmpeg + PIL + the `tts` binary, plus the visual
+source chosen by the video-provider layer (scripts/video_providers.py).
+$0 spend by default. Nothing publishes, sends, uploads, or
+schedules.
 
-Two visual sources, in order of preference:
+Visual sources, in order of preference:
   1. Real footage (--footage) — used whenever supplied, never
-     replaced by generated stills.
-  2. AI-generated stills (default when no footage is given, unless
-     --no-gen-visuals): one Pollinations still per scene, given slow
-     Ken Burns motion (FFmpeg zoompan). That is AI stills + motion —
-     NOT true AI video motion and NOT real footage — and it is
-     labelled exactly that way in the stage file.
+     replaced by generated visuals.
+  2. The configured provider (--video-provider, VIDEO_PROVIDER,
+     video_providers.yaml, else the $0 default): AI-generated stills
+     (Pollinations, free) + slow Ken Burns motion, OR true AI video
+     motion from a local model (WanGP/FramePack/custom command), OR
+     paid cloud video (Muapi Sora/Runway). Whoever has the hardware
+     or the paid key uses it; whoever doesn't gets a clear
+     missing-input list instead of a fake video. A provider is never
+     silently swapped unless a fallback is set in the config.
 
 What it builds (video formats only): the chosen visuals (scaled/
 cropped to 9:16 1080x1920 for short video, 16:9 1920x1080 for long
@@ -22,23 +24,20 @@ video, 30fps) + TTS voiceover of the templated voiceover lines +
 burned-in line captions + the exact-logo end card (3s) ->
 <out-dir>/video.mp4 (+faststart, H.264 + AAC).
 
-Without footage AND without generation (or when generation fails for
-all 3 scenes) it builds nothing and writes the production plan plus
-the exact missing inputs instead. It never claims a video it did not
-build. There is no true AI text-to-video generation here
-(region-blocked). Captions are line-level, burned from the known
-voiceover text (not word-level karaoke — the faster-whisper caption
-helper is not present on this machine).
+Without a usable visual source it builds nothing and writes the
+production plan plus the exact missing inputs instead. It never
+claims a video it did not build. Captions are line-level, burned
+from the known voiceover text (not word-level karaoke — the
+faster-whisper caption helper is not present on this machine).
 """
+
 from __future__ import annotations
 
-import json
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 
-from scripts import gen_visuals
+from scripts import video_providers
+from scripts.video_providers import _run, probe_duration
 
 ROOT = Path(__file__).resolve().parent.parent
 LOGO_LOCKUP = Path.home() / "workspace" / "talvenor-brand" / "logos" / "talvenor-logo.png"
@@ -49,7 +48,6 @@ FONT_REG = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
 BRAND_LINE = "You run the jobs. We run the phone."
 CTA_LINE = "Book a call with Talvenor. Link in bio."
 ENDCARD_SECS = 3.0
-VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 
 # Templated voiceover lines (rewrite before shipping — same rule as the
 # templated hook in the script stage). No invented stats or clients.
@@ -58,59 +56,6 @@ VO_LINES = [
     "Talvenor answers every call, day and night, and books the job.",
     "Book a call with Talvenor. Link in bio.",
 ]
-
-
-# ---------------------------------------------------------------------------
-# small helpers
-# ---------------------------------------------------------------------------
-def _run(cmd: list[str], timeout: int = 180) -> tuple[bool, str]:
-    """Run a local command; returns (ok, stderr-tail-or-output)."""
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, f"timed out after {timeout}s: {cmd[0]}"
-    except Exception as exc:  # noqa: BLE001 - record, don't crash
-        return False, f"could not start {cmd[0]}: {exc}"
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "no output").strip()
-        return False, f"{Path(cmd[0]).name} exited {proc.returncode}: {detail[-500:]}"
-    return True, (proc.stdout or "").strip()
-
-
-def probe_duration(path: Path) -> float:
-    """Media duration in seconds via ffprobe; 0.0 when unreadable."""
-    ok, out = _run(["ffprobe", "-v", "error", "-show_entries",
-                    "format=duration", "-of", "json", str(path)], timeout=60)
-    if not ok:
-        return 0.0
-    try:
-        return float(json.loads(out)["format"]["duration"])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return 0.0
-
-
-def collect_footage(arg: str) -> list[dict]:
-    """Resolve --footage (one file, or a directory of clips).
-
-    Returns a list of {path, duration} in order, skipping files that
-    are not video or have no readable duration.
-    """
-    p = Path(arg).expanduser()
-    clips: list[dict] = []
-    if p.is_file():
-        if p.suffix.lower() in VIDEO_EXTS:
-            dur = probe_duration(p)
-            if dur > 0:
-                clips.append({"path": p, "duration": dur})
-        return clips
-    if p.is_dir():
-        for f in sorted(p.iterdir()):
-            if f.is_file() and f.suffix.lower() in VIDEO_EXTS:
-                dur = probe_duration(f)
-                if dur > 0:
-                    clips.append({"path": f, "duration": dur})
-    return clips
 
 
 def derive_vo_lines() -> list[str]:
@@ -229,110 +174,6 @@ def tts_line(text: str, voice: str, out_path: Path) -> tuple[bool, str]:
     return True, f"{dur:.1f}s"
 
 
-def _footage_cut(clips: list[dict], used: float, width: int,
-                 height: int, work: Path) -> tuple[Path | None, str]:
-    """Cut the footage clips into one continuous file.
-
-    Returns (path|None, detail)."""
-    take: list[tuple[dict, float]] = []
-    remaining = used
-    for clip in clips:
-        if remaining <= 0:
-            break
-        take.append((clip, min(clip["duration"], remaining)))
-        remaining -= take[-1][1]
-    filter_parts = []
-    for i, (clip, t) in enumerate(take):
-        filter_parts.append(
-            f"[{i}:v]trim=0:{t:.3f},setpts=PTS-STARTPTS,"
-            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},fps=30,format=yuv420p[v{i}]")
-    filter_parts.append("".join(f"[v{i}]" for i in range(len(take))) +
-                        f"concat=n={len(take)}:v=1:a=0[vout]")
-    cut_path = work / "footage_cut.mp4"
-    ok, detail = _run(["ffmpeg", "-y", *sum([["-i", str(c["path"])]
-                                             for c, _ in take], []),
-                       "-filter_complex", ";".join(filter_parts),
-                       "-map", "[vout]", "-c:v", "libx264", "-crf", "20",
-                       "-preset", "veryfast", "-an", str(cut_path)],
-                      timeout=600)
-    if not ok or not cut_path.exists():
-        return None, detail
-    return cut_path, "ok"
-
-
-# One Ken Burns move per scene, so the three scenes do not all drift
-# the same way. {frames} is the segment length in frames (150 = 5s).
-ZOOM_MOVES = [
-    # zoom in, centred
-    "zoompan=z='min(1+0.0009*on,1.12)':x='iw/2-(iw/zoom/2)'"
-    ":y='ih/2-(ih/zoom/2)'",
-    # zoom out, centred
-    "zoompan=z='max(1.12-0.0009*on,1.0)':x='iw/2-(iw/zoom/2)'"
-    ":y='ih/2-(ih/zoom/2)'",
-    # slow pan right at a fixed zoom
-    "zoompan=z='1.1':x='(iw-iw/zoom)*on/{frames}':y='(ih-ih/zoom)/2'",
-]
-
-
-def _motion_segment(still: Path | None, width: int, height: int,
-                    scene_dur: float, move: str,
-                    out_path: Path) -> tuple[bool, str]:
-    """One scene-length segment from a still (Ken Burns) or a slate.
-
-    A failed scene gets a plain dark slate — recorded honestly in the
-    scene record, never a fake image."""
-    frames = int(round(scene_dur * 30))
-    if still is not None and still.exists():
-        vf = (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-              f"crop={width}:{height},"
-              f"{move.format(frames=frames)}:d={frames}:s={width}x{height}"
-              ":fps=30,format=yuv420p")
-        ok, detail = _run(["ffmpeg", "-y", "-i", str(still),
-                           "-vf", vf, "-frames:v", str(frames),
-                           "-an", "-c:v", "libx264", "-crf", "20",
-                           "-preset", "veryfast", str(out_path)],
-                          timeout=300)
-    else:
-        ok, detail = _run(["ffmpeg", "-y", "-f", "lavfi", "-i",
-                           f"color=c=0x0b1d33:s={width}x{height}:r=30"
-                           f":d={scene_dur:.2f}",
-                           "-vf", "format=yuv420p", "-frames:v",
-                           str(frames), "-an", "-c:v", "libx264",
-                           "-crf", "20", "-preset", "veryfast",
-                           str(out_path)], timeout=120)
-    if not ok or not out_path.exists():
-        return False, detail
-    return True, "ok"
-
-
-def _motion_cut(stills: list[dict], width: int, height: int,
-                scene_dur: float, work: Path) -> tuple[Path | None, str]:
-    """Motion cut from generated stills. Returns (path|None, detail)."""
-    segments: list[Path] = []
-    for i, rec in enumerate(stills):
-        seg = work / f"motion_scene{i}.mp4"
-        still = Path(rec["path"]) if rec["ok"] and rec.get("path") else None
-        ok, detail = _motion_segment(
-            still, width, height, scene_dur,
-            ZOOM_MOVES[i % len(ZOOM_MOVES)], seg)
-        if not ok:
-            return None, f"scene {i + 1} motion render failed ({detail})"
-        segments.append(seg)
-    cut_path = work / "motion_cut.mp4"
-    concat_list = work / "motion_concat.txt"
-    concat_list.write_text(
-        "".join(f"file '{p.resolve()}'\n" for p in segments),
-        encoding="utf-8")
-    ok, detail = _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                       "-i", str(concat_list), "-c:v", "libx264",
-                       "-crf", "20", "-preset", "veryfast", "-an",
-                       str(cut_path)], timeout=300)
-    if not ok or not cut_path.exists():
-        return None, detail
-    return cut_path, "ok"
-
-
 # ---------------------------------------------------------------------------
 # the build
 # ---------------------------------------------------------------------------
@@ -349,6 +190,8 @@ def build_video(args, out_dir: Path, work: Path) -> dict:
         "missing": [], "plan": _plan(args), "audio": "",
         "source": "none",
         "gen": {"attempted": False, "per_scene": []},
+        "provider": "none",
+        "provider_scenes": [],
     }
     if getattr(args, "no_video", False):
         result["reason"] = "skipped — --no-video was passed"
@@ -372,70 +215,48 @@ def build_video(args, out_dir: Path, work: Path) -> dict:
     result["width"], result["height"] = width, height
     work.mkdir(parents=True, exist_ok=True)
 
-    # --- visual source: real footage first, generated stills second ---
-    scene_count = 3
-    scene_sources: list[str] = []
-    cut_path: Path | None = None
-    if getattr(args, "footage", ""):
-        clips = collect_footage(args.footage)
-        if not clips:
-            result["reason"] = (f"no usable video files found at "
-                                f"{args.footage} — no video was built")
-            result["missing"] = [f"a video file (or a folder of video files) at {args.footage}"]
-            result["plan"] = _plan(args)
-            return result
-        result["source"] = "real footage"
-        total = sum(c["duration"] for c in clips)
-        used = min(total, cap)
-        if total < cap:
-            result["fallbacks"].append(
-                f"footage totalled {total:.1f}s, under the {cap:.0f}s target — "
-                f"the video uses all {used:.1f}s of it")
-        scene_dur = used / scene_count
-        scene_sources = ["real footage"] * scene_count
-        cut_path, detail = _footage_cut(clips, used, width, height, work)
-        if cut_path is None:
-            result["reason"] = f"footage cut failed ({detail}) — no video was built"
-            result["plan"] = _plan(args)
-            return result
-    elif getattr(args, "gen_visuals", True):
-        # No footage: generate AI stills. This is the default — topic
-        # in, video out, with no footage input.
-        result["gen"]["attempted"] = True
-        stills = gen_visuals.generate_stills(work / "stills", width, height)
-        result["gen"]["per_scene"] = stills
-        if not any(s["ok"] for s in stills):
-            result["reason"] = (
-                "AI still generation failed for all 3 scenes "
-                "(Pollinations, free) — no video was built")
-            result["missing"] = _missing_inputs(gen_failed=True,
-                                               stills=stills)
-            result["plan"] = _plan(args)
-            return result
-        result["source"] = "AI-generated stills + motion (Pollinations, free)"
-        result["fallbacks"].append(
-            "visuals are AI-generated stills with slow Ken Burns motion "
-            "(Pollinations, free) — not real footage and not true AI "
-            "video motion")
-        used = 15.0  # 3 stills x 5s each
-        scene_dur = used / scene_count
-        scene_sources = [
-            (f"generated still scene{s['scene']}.jpg + Ken Burns motion"
-             if s["ok"] else
-             f"fallback slate — still generation failed ({s['note']})")
-            for s in stills
+    # --- visual source: the resolved video provider ------------------
+    cfg, cfg_errors = video_providers.resolve(args)
+    if cfg_errors:
+        result["reason"] = ("video provider configuration error — no "
+                            "video was built: " + "; ".join(cfg_errors))
+        result["missing"] = [
+            f"a valid video provider setup ({err}) — see "
+            "video_providers.yaml and README.md 'Video providers'"
+            for err in cfg_errors
         ]
-        cut_path, detail = _motion_cut(stills, width, height, scene_dur,
-                                       work)
-        if cut_path is None:
-            result["reason"] = f"motion cut failed ({detail}) — no video was built"
-            result["plan"] = _plan(args)
-            return result
-    else:
+        result["plan"] = _plan(args)
+        return result
+    # --no-gen-visuals disables the stills provider (the $0 default);
+    # it does not touch footage, local, or api.
+    provider_name = video_providers.resolve_provider(args, cfg)
+    if provider_name == "stills" and not getattr(args, "gen_visuals", True):
         result["reason"] = "no footage supplied — no video was built"
         result["missing"] = _missing_inputs()
         result["plan"] = _plan(args)
         return result
+    scene_count = 3
+    ctx = {
+        "args": args, "work": work, "width": width, "height": height,
+        "scene_count": scene_count, "cap": cap,
+        "scenes": video_providers.scene_prompts(),
+        "format": args.format,
+    }
+    vis = video_providers.run_provider(args, cfg, ctx)
+    result["provider"] = vis.get("provider", provider_name)
+    result["provider_scenes"] = vis.get("provider_scenes", [])
+    result["gen"] = vis.get("gen", {"attempted": False, "per_scene": []})
+    result["source"] = vis.get("source", "none")
+    result["fallbacks"].extend(vis.get("fallbacks", []))
+    if vis.get("cut_path") is None:
+        result["reason"] = vis.get("reason") or "no video was built"
+        result["missing"] = vis.get("missing", [])
+        result["plan"] = _plan(args)
+        return result
+    cut_path = vis["cut_path"]
+    used = vis["used"]
+    scene_dur = vis["scene_dur"]
+    scene_sources = vis["scene_sources"]
 
     vo_lines = derive_vo_lines()
     # --- voiceover ------------------------------------------------------
@@ -458,7 +279,7 @@ def build_video(args, out_dir: Path, work: Path) -> dict:
             "carry the words")
 
     # --- scene segments with burned-in captions -------------------------
-    # cut_path is already built (footage cut or motion cut from stills);
+    # cut_path is already built (by the resolved video provider);
     # scenes are sliced from it and captioned below.
     fontsize = 64 if is_short else 56
     cap_y = int(height * 0.62) if is_short else int(height * 0.70)
@@ -643,3 +464,4 @@ def _missing_inputs(gen_failed: bool = False,
             "the video from them with slow motion. Draft quality, not "
             "real footage.")
     return items
+
