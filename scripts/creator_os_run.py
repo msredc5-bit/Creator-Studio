@@ -89,7 +89,11 @@ from src.creator_workers import (  # noqa: E402
     VisualProducer,
 )
 from src.workers.base import MockLLM, Task  # noqa: E402
+from scripts.gen_visuals import is_talvenor  # noqa: E402
+from scripts.make_thumbnail import build_thumbnail  # noqa: E402
 from scripts.video_build import build_video  # noqa: E402
+from scripts.video_providers import _run as run_cmd  # noqa: E402
+from scripts.video_providers import collect_footage  # noqa: E402
 from scripts.loop_next import build_plan as build_loop_plan  # noqa: E402
 from scripts.upload_youtube import (  # noqa: E402
     UploadError,
@@ -465,11 +469,68 @@ def stage_script(args, out_dir: Path, llm: MockLLM,
     return write_stage(out_dir, "02-script.md", text)
 
 
+def build_thumbnail_for_run(args, out_dir: Path,
+                            thumb_text: str) -> tuple[str | None, str]:
+    """Build thumbnail.jpg in the out dir from the best visual.
+
+    Returns (path_str | None, note). Best visual, in order: the
+    first frame of --footage (grabbed with ffmpeg), else
+    video_work/stills/scene1.jpg when it already exists (a re-run,
+    or the video stage's stills). No visual yet → (None, honest
+    reason): at stage 3 the stills do not exist yet — they are
+    generated in stage 4, which retries this same helper.
+    """
+    source: Path | None = None
+    footage = getattr(args, "footage", "") or ""
+    if footage:
+        clips = collect_footage(footage)
+        if clips:
+            work = out_dir / "video_work"
+            work.mkdir(parents=True, exist_ok=True)
+            frame = work / "thumb-frame.jpg"
+            ok, _ = run_cmd(["ffmpeg", "-y", "-ss", "0.5", "-i",
+                             str(clips[0]["path"]), "-frames:v", "1",
+                             str(frame)], timeout=60)
+            if ok and frame.exists():
+                source = frame
+    if source is None:
+        still = out_dir / "video_work" / "stills" / "scene1.jpg"
+        if still.exists():
+            source = still
+    if source is None:
+        return None, ("no thumbnail built — no visual exists yet: "
+                      "no --footage was given and the AI stills are "
+                      "generated in stage 4 (the video stage retries "
+                      "the thumbnail from scene 1 then)")
+    thumb_path = out_dir / "thumbnail.jpg"
+    res = build_thumbnail(source, thumb_text, thumb_path)
+    if not res["ok"]:
+        return None, f"thumbnail build failed: {res['error']}"
+    note = res.get("note", "")
+    return str(thumb_path), note
+
+
+def thumb_text_for(args) -> tuple[str, str]:
+    """The (title, thumbnail text) for this run.
+
+    Thumbnail text: --thumb when given; the Talvenor line only
+    for Talvenor runs; otherwise the first 3 words of the title,
+    uppercased.
+    """
+    title = args.title or derive_title(args.topic)
+    if args.thumb:
+        thumb = args.thumb
+    elif is_talvenor(args.topic, getattr(args, "brand", "auto")):
+        thumb = "NEVER MISS A CALL"
+    else:
+        thumb = " ".join(title.split()[:3]).upper() or "WATCH THIS TEST"
+    return title, thumb
+
+
 def stage_visual(args, out_dir: Path, llm: MockLLM) -> Path:
     result = run_worker(VisualProducer, {
         "topic": args.topic, "format": args.format}, llm)
-    title = args.title or derive_title(args.topic)
-    thumb = args.thumb or "NEVER MISS A CALL"
+    title, thumb = thumb_text_for(args)
     text = stage_header(3, "Visual + Package",
                         "VisualProducer + yt-package title.py "
                         "(title + thumbnail as one pairing)", "ok")
@@ -492,6 +553,15 @@ def stage_visual(args, out_dir: Path, llm: MockLLM) -> Path:
             text += f"title.py output could not be parsed:\n\n```\n{out}\n```\n"
     else:
         text += f"title.py did not run: {out}\n"
+    thumb_path, thumb_note = build_thumbnail_for_run(args, out_dir, thumb)
+    text += "\n## Thumbnail\n\n"
+    if thumb_path:
+        text += (f"- Built: `{thumb_path}` (1280x720 JPG)\n"
+                 f"- Text: \"{thumb}\"\n")
+        if thumb_note:
+            text += f"- Note: {thumb_note}\n"
+    else:
+        text += f"- Not built: {thumb_note}\n"
     return write_stage(out_dir, "03-visual-package.md", text)
 
 
@@ -503,24 +573,49 @@ def stage_video(args, out_dir: Path) -> Path:
     # about TTS (the tts binary synthesises through its own service)
     # or about Pollinations (the one network call in this repo).
     result = build_video(args, out_dir, out_dir / "video_work")
+    # Thumbnail retry: stage 3 could not build one without a visual
+    # (stills are generated here, in stage 4). Build it from scene 1
+    # now and record it in 03-visual-package.md. Skipped on dry
+    # runs — nothing was executed, so there is no visual to use.
+    thumb_path = out_dir / "thumbnail.jpg"
+    if not thumb_path.exists() and not getattr(args, "video_dry_run",
+                                               False):
+        _, thumb = thumb_text_for(args)
+        built, thumb_note = build_thumbnail_for_run(args, out_dir, thumb)
+        if built:
+            visual_path = out_dir / "03-visual-package.md"
+            with open(visual_path, "a", encoding="utf-8") as fh:
+                fh.write("\n## Thumbnail (built in stage 4)\n\n"
+                         f"- Built: `{built}` (1280x720 JPG)\n"
+                         f"- Text: \"{thumb}\"\n"
+                         "- Source: scene 1 still (stage 3 had no "
+                         "visual yet)\n")
+                if thumb_note:
+                    fh.write(f"- Note: {thumb_note}\n")
+    # The end card follows the plan's brand: Talvenor runs get the
+    # exact logo; any other topic gets a text-only card.
+    endcard_phrase = ("exact-logo end card"
+                      if result.get("endcard", {}).get("logo_used")
+                      else "text-only end card (no brand logo)")
     if result["source"] == "real footage":
         sources = ("Reel Factory build — real footage + TTS voiceover "
-                   "+ burned-in captions + exact-logo end card")
+                   f"+ burned-in captions + {endcard_phrase}")
         mode = "local build (FFmpeg + tts binary, $0)"
     elif result["gen"]["attempted"]:
         sources = ("Reel Factory build — AI-generated stills + slow "
                    "Ken Burns motion (Pollinations, free) + TTS voiceover "
-                   "+ burned-in captions + exact-logo end card")
+                   f"+ burned-in captions + {endcard_phrase}")
         mode = ("local build (FFmpeg + tts binary + Pollinations image "
                 "generation, $0, no key)")
     else:
         sources = ("Reel Factory build — real footage + TTS voiceover "
-                   "+ burned-in captions + exact-logo end card")
+                   f"+ burned-in captions + {endcard_phrase}")
         mode = "local build (FFmpeg + tts binary, $0)"
     text = ("# Stage 4 — Video (Reel Factory)\n\n"
             f"Sources: {sources}\n"
             f"Mode: {mode}. "
-            f"{GATE_NOTE}\nGate: `upload it`\n\n---\n")
+            f"{GATE_NOTE}\nGate: `upload it`\n\n"
+            f"VO source: {result.get('vo_source', 'templated lines')}\n\n---\n")
     plan = result["plan"]
     if result["built"]:
         text += (f"## Built\n\n- Output: `{result['video_path']}`\n"
@@ -532,6 +627,14 @@ def stage_video(args, out_dir: Path) -> Path:
                  "file decodes cleanly (ffmpeg -f null).\n\n")
     else:
         text += (f"## No video was built\n\n{result['reason']}.\n\n")
+    if result.get("dry_run"):
+        text += ("## Dry run — nothing was executed\n\n"
+                 "What the resolved provider WOULD do on a real run "
+                 "(--video-dry-run). No engine started, no still was "
+                 "fetched, no key was read, no video was built.\n\n")
+        for line in result["dry_run"]:
+            text += f"- {line}\n"
+        text += "\n"
     if result["missing"]:
         text += "## Missing inputs — needed from Boss\n\n"
         for item in result["missing"]:
@@ -568,10 +671,14 @@ def stage_video(args, out_dir: Path) -> Path:
              f"Voice: {plan.get('voice', '')} "
              "(override with --voice).\n\n")
     endcard = plan.get("endcard", {})
+    if endcard.get("logo"):
+        logo_line = (f"- Logo: exact file `{endcard.get('logo')}` — "
+                     "pasted flat, never redrawn\n")
+    else:
+        logo_line = "- Logo: none — text-only end card (no brand logo)\n"
     text += ("## End card\n\n"
              f"- Duration: {endcard.get('duration_s')}s\n"
-             f"- Logo: exact file `{endcard.get('logo')}` — pasted flat, "
-             "never redrawn\n"
+             + logo_line +
              f"- Headline: \"{endcard.get('headline')}\"\n"
              f"- CTA: \"{endcard.get('cta')}\"\n")
     if result["built"]:
@@ -593,6 +700,16 @@ def stage_video(args, out_dir: Path) -> Path:
             text += "\n## Fallbacks (read before shipping)\n\n"
             for fb in result["fallbacks"]:
                 text += f"- {fb}\n"
+    vo_source = result.get("vo_source", "templated lines")
+    if vo_source.startswith("--script") or vo_source == "vo-lines.txt":
+        vo_line = ("- Voiceover lines came from the agent's script file "
+                   f"({vo_source}); rewrite them there, then re-run.\n")
+    elif result.get("endcard", {}).get("logo_used"):
+        vo_line = ("- Voiceover lines are templated from the brand pitch; "
+                   "rewrite them before shipping.\n")
+    else:
+        vo_line = ("- Voiceover lines are templated from the topic; "
+                   "rewrite them before shipping.\n")
     text += ("\n## Limits\n\n"
              "- The $0 default visual source is AI stills (Pollinations, "
              "free) with slow Ken Burns motion — AI stills + motion, "
@@ -601,8 +718,7 @@ def stage_video(args, out_dir: Path) -> Path:
              "WanGP/FramePack) or the api provider (your own paid key: "
              "Muapi Sora/Runway) — see README.md 'Video providers'. "
              "Neither a GPU nor a key is wired in here.\n"
-             "- Voiceover lines are templated from the brand pitch; "
-             "rewrite them before shipping.\n"
+             + vo_line +
              "- This file is a build record, not an upload. Gate: "
              "`upload it` — the owner uploads, if at all.\n")
     return write_stage(out_dir, "04-video.md", text)
@@ -863,6 +979,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--topic", default="",
                     help="The one idea this run is about. If omitted, "
                          "the niche finder picks one (see --find-niche).")
+    ap.add_argument("--brand", default="auto",
+                    choices=["auto", "talvenor", "generic"],
+                    help="Video template brand. auto (default): the "
+                         "Talvenor template (missed-call lines, logo, "
+                         "plumber scenes) applies ONLY when the topic "
+                         "mentions Talvenor or the AI receptionist; any "
+                         "other topic gets neutral topic-derived lines "
+                         "and a text-only end card. talvenor forces the "
+                         "brand template; generic forces the neutral one.")
     ap.add_argument("--format", default="short video", choices=FORMATS,
                     help="Content format (default: short video).")
     ap.add_argument("--niche", default="",
@@ -887,7 +1012,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--title", default="",
                     help="Video title to lint (default: the topic).")
     ap.add_argument("--thumb", default="",
-                    help="Thumbnail text (default: NEVER MISS A CALL).")
+                    help="Thumbnail text (default: first 3 words of the "
+                         "title, uppercased; Talvenor runs: "
+                         "NEVER MISS A CALL).")
+    ap.add_argument("--script", default="",
+                    help="Voiceover script file: one line per scene "
+                         "(first 3 lines used for the 3 scenes). The "
+                         "agent writes this in pass 2 — a vo-lines.txt "
+                         "left in the out dir is picked up "
+                         "automatically. A missing/unreadable --script "
+                         "file fails the video stage honestly; it never "
+                         "silently falls back to templated lines.")
     ap.add_argument("--transcript", default="",
                     help="Timestamped transcript (.srt/.vtt/whisper .json).")
     ap.add_argument("--retention", default="",
@@ -909,6 +1044,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--video-config", default="",
                     help="Video provider config file (default: "
                          "video_providers.yaml at the repo root).")
+    ap.add_argument("--video-dry-run", action="store_true",
+                    help="Dry run for the video stage: print what the "
+                         "resolved provider WOULD do (exact command, GPU "
+                         "check, missing setup) and stop — no engine "
+                         "starts, no still is fetched, no key is read, "
+                         "no video is built. Use it to check a GPU "
+                         "machine's setup before a real run.")
     ap.add_argument("--gen-visuals", dest="gen_visuals",
                     action="store_true", default=True,
                     help="Generate AI stills when no --footage is given "

@@ -50,6 +50,12 @@ STYLE_SIMPLE = "photorealistic, face not visible, no text"
 # One prompt per scene of the fixed 3-scene story. Workers are shown
 # from behind, hands, or over-the-shoulder — never a recognizable
 # face, never a named real person.
+#
+# BRAND RULE: these Talvenor scenes (plumber, missed phone,
+# receptionist) belong to Talvenor runs ONLY. Any other topic gets
+# GENERIC_SCENES below — never the brand's story. scenes_for()
+# is the one place that decides; every provider and the video
+# stage go through it.
 SCENES = [
     {
         "scene": 1,
@@ -77,6 +83,61 @@ SCENES = [
         "simple": "receptionist with headset seen from behind at a desk",
     },
 ]
+
+# Neutral scenes for any non-Talvenor topic: testing a tool on
+# screen. Same no-face rule as above.
+GENERIC_SCENES = [
+    {
+        "scene": 1,
+        "shows": "Opening: the topic on screen",
+        "prompt": ("laptop screen showing a software test in progress, "
+                   "over-the-shoulder view, desk and notebook nearby, "
+                   "warm light"),
+        "simple": "laptop screen showing a software test",
+    },
+    {
+        "scene": 2,
+        "shows": "The test running on screen, step by step",
+        "prompt": ("hands typing on a laptop keyboard, close-up, "
+                   "screen glow, warm light"),
+        "simple": "hands typing on a laptop keyboard",
+    },
+    {
+        "scene": 3,
+        "shows": "The verdict on screen",
+        "prompt": ("person watching test results on a large screen, "
+                   "seen from behind, back of head and shoulders only, "
+                   "warm light"),
+        "simple": "person watching results on a screen from behind",
+    },
+]
+
+
+def is_talvenor(topic: str | None, brand: str | None = None) -> bool:
+    """True only when this run is a Talvenor run.
+
+    The Talvenor brand template (missed-call lines, Talvenor logo,
+    plumber/receptionist scenes) applies ONLY then. --brand
+    talvenor forces it; --brand generic forces the neutral
+    template; auto (default) detects "talvenor" or "receptionist"
+    in the topic — the product itself is the AI receptionist, so
+    a receptionist topic is a Talvenor topic even without the
+    brand name in it.
+    """
+    b = (brand or "auto").lower()
+    if b == "talvenor":
+        return True
+    if b == "generic":
+        return False
+    t = (topic or "").lower()
+    return "talvenor" in t or "receptionist" in t
+
+
+def scenes_for(topic: str | None = None,
+               brand: str | None = None) -> list[dict]:
+    """The scene specs for this run — Talvenor's or the neutral set."""
+    return list(SCENES) if is_talvenor(topic, brand) \
+        else list(GENERIC_SCENES)
 
 
 def _timeout(env_name: str, default: int) -> int:
@@ -136,17 +197,20 @@ def _build_url(prompt: str, width: int, height: int, seed: int) -> str:
 
 
 def generate_stills(stills_dir: Path, width: int, height: int,
-                    seed: int = DEFAULT_SEED) -> list[dict]:
+                    seed: int = DEFAULT_SEED,
+                    scenes: list[dict] | None = None) -> list[dict]:
     """Generate one still per scene. Returns a per-scene record list.
 
     Each record: {scene, shows, ok, path (str|None), prompt,
     note}. Never raises; every failure is recorded in its record.
+    `scenes` defaults to the Talvenor set (SCENES) — callers that
+    know the topic pass scenes_for(topic, brand) instead.
     """
     stills_dir.mkdir(parents=True, exist_ok=True)
     timeout = _timeout("CREATOR_OS_GEN_TIMEOUT", GEN_TIMEOUT)
     retry_timeout = _timeout("CREATOR_OS_GEN_RETRY_TIMEOUT", RETRY_TIMEOUT)
     records: list[dict] = []
-    for spec in SCENES:
+    for spec in (scenes if scenes is not None else SCENES):
         out_path = stills_dir / f"scene{spec['scene']}.jpg"
         prompt = f"{spec['prompt']}, {STYLE}"
         url = _build_url(prompt, width, height, seed + spec["scene"])
@@ -154,7 +218,7 @@ def generate_stills(stills_dir: Path, width: int, height: int,
         used_prompt = prompt
         if not ok:
             # One retry with a simpler prompt, per the skill's rule.
-            simple = f"{spec['simple']}, {STYLE_SIMPLE}"
+            simple = f"{spec.get('simple', spec['prompt'])}, {STYLE_SIMPLE}"
             url = _build_url(simple, width, height, seed + spec["scene"])
             ok2, note2 = _fetch(url, out_path, retry_timeout)
             if ok2:

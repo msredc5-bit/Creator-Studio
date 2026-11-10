@@ -373,6 +373,234 @@ def test_provider_config_bad_name():
         vp.parse_config_text("provider: stills\nfallback: bogus\n")
 
 
+# ---------------------------------------------------------------------------
+# video stage brand-awareness: the Talvenor template (missed-call
+# lines, Talvenor logo, plumber/receptionist scenes) applies ONLY
+# to Talvenor runs. Any other topic gets neutral topic-derived
+# lines and a text-only end card.
+# ---------------------------------------------------------------------------
+def test_video_plan_generic_topic_has_no_talvenor():
+    import json
+    from scripts.video_build import _plan
+    args = _provider_args(topic="Nano Banana 2 free test: 5 photo edits",
+                          format="long video", brand="auto")
+    plan = _plan(args)
+    blob = json.dumps(plan)
+    assert "Talvenor" not in blob
+    assert "missed call" not in blob
+    assert "Nano Banana 2" in plan["scenes"][0]["vo_line"]
+    assert plan["endcard"]["logo"] == ""
+    assert plan["endcard"]["cta"] == "Subscribe for the next test."
+
+
+def test_video_plan_talvenor_topic_keeps_brand():
+    from scripts.video_build import _plan
+    args = _provider_args(topic="Talvenor AI receptionist for plumbers",
+                          format="short video", brand="auto")
+    plan = _plan(args)
+    assert plan["scenes"][0]["vo_line"] == "Every missed call is a lost job."
+    assert plan["scenes"][2]["shows"] == "Talvenor answering and booking"
+    assert plan["endcard"]["logo"].endswith("talvenor-logo.png")
+    assert plan["endcard"]["headline"] == "You run the jobs. We run the phone."
+
+
+def test_video_plan_brand_flag_overrides_topic():
+    import json
+    from scripts.video_build import _plan
+    args = _provider_args(topic="Nano Banana 2 free test",
+                          format="short video", brand="talvenor")
+    assert _plan(args)["scenes"][0]["vo_line"] == \
+        "Every missed call is a lost job."
+    args2 = _provider_args(topic="Talvenor AI receptionist",
+                           format="short video", brand="generic")
+    blob = json.dumps(_plan(args2))
+    # The topic name itself may appear, but no brand lines or logo.
+    assert "missed call" not in blob
+    assert "talvenor-logo.png" not in blob
+    assert "You run the jobs" not in blob
+
+
+def test_scene_prompts_follow_topic():
+    import json
+    generic = vp.scene_prompts(topic="Nano Banana 2 test")
+    blob = json.dumps(generic)
+    assert "Talvenor" not in blob
+    assert "plumber" not in blob.lower()
+    assert "receptionist" not in blob.lower()
+    # No topic given: no brand is assumed either — the neutral set.
+    assert "Talvenor" not in json.dumps(vp.scene_prompts())
+
+
+# ---------------------------------------------------------------------------
+# agent-is-the-brain upgrade: --script voiceover lines, real thumbnail,
+# working voice (tts stdin fix)
+# ---------------------------------------------------------------------------
+def test_tts_line_feeds_stdin_and_synthesises(tmp_path):
+    """Regression: tts_line once passed --text-stdin without feeding
+    stdin, so the binary waited for input until the 60s timeout on
+    every line and all videos came out silent.
+    """
+    from scripts.video_build import tts_line
+    from scripts.video_providers import probe_duration
+    out = tmp_path / "vo.mp3"
+    ok, note = tts_line("Testing the free AI tool today.",
+                        "avocado_v2:MAI_01", out)
+    if ok:
+        assert out.exists() and out.stat().st_size > 0
+        assert probe_duration(out) > 0
+    else:
+        # The tts service itself may be briefly down — but the old
+        # bug (waiting on stdin) must not be the reason.
+        assert "timed out after 60s" not in note, note
+
+
+def test_script_lines_flow_into_plan(tmp_path):
+    from scripts.video_build import _plan, resolve_vo_lines
+    script = tmp_path / "vo-lines.txt"
+    script.write_text(
+        "Nano Banana turns a photo into a figurine.\n"
+        "It changed only the background here.\n"
+        "And the verdict: free is enough for this edit.\n"
+        "One extra line, ignored.\n", encoding="utf-8")
+    args = _provider_args(topic="Nano Banana 2 free test",
+                          format="short video", brand="generic",
+                          script=str(script))
+    vo = resolve_vo_lines(args, tmp_path)
+    assert vo["error"] is None
+    assert vo["source"].startswith("--script")
+    assert vo["lines"][0].startswith("Nano Banana turns")
+    plan = _plan(args, vo["lines"])
+    assert plan["scenes"][0]["vo_line"] == \
+        "Nano Banana turns a photo into a figurine."
+    assert plan["scenes"][2]["vo_line"] == \
+        "And the verdict: free is enough for this edit."
+    assert "only the first 3" in " ".join(plan.get("vo_notes", []))
+
+
+def test_missing_script_file_fails_honestly(tmp_path):
+    from scripts.video_build import build_video
+    args = _provider_args(topic="Nano Banana 2 free test",
+                          format="short video", brand="generic",
+                          script=str(tmp_path / "nope.txt"))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result = build_video(args, out_dir, out_dir / "video_work")
+    assert result["built"] is False
+    assert "script" in result["reason"].lower()
+    assert not (out_dir / "video.mp4").exists()
+
+
+def test_script_with_apostrophe_builds_video(tmp_path):
+    """Regression: a VO line with an apostrophe (Google's) broke the
+    ffmpeg drawtext filter (No such filter: '0.30') and no video
+    was built. Captions now go through textfile, so punctuation
+    in script lines is safe.
+    """
+    import subprocess
+    clip = tmp_path / "test-footage.mp4"
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i",
+         "testsrc=duration=12:size=640x360:rate=30",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip)],
+        capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    script = tmp_path / "vo-lines.txt"
+    script.write_text("Google's free tool: test it yourself.\n"
+                      "Don't guess — watch what changes.\n"
+                      "It's free, and here's the verdict.\n",
+                      encoding="utf-8")
+    out_dir = tmp_path / "out"
+    code = run_pipeline([
+        "--topic", "Nano Banana 2 free test",
+        "--format", "short video",
+        "--footage", str(clip),
+        "--script", str(script),
+        "--out", str(out_dir),
+    ])
+    assert code == 0
+    text = (out_dir / "04-video.md").read_text(encoding="utf-8")
+    assert "## Built" in text, text
+    assert "Google's free tool" in text
+    assert (out_dir / "video.mp4").exists()
+
+
+def test_vo_lines_txt_auto_pickup(tmp_path):
+    from scripts.video_build import resolve_vo_lines
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "vo-lines.txt").write_text(
+        "Line one here.\nLine two here.\nLine three here.\n",
+        encoding="utf-8")
+    args = _provider_args(topic="Nano Banana 2 free test",
+                          format="short video", brand="generic")
+    vo = resolve_vo_lines(args, out_dir)
+    assert vo["error"] is None
+    assert vo["source"] == "vo-lines.txt"
+    assert vo["lines"] == ["Line one here.", "Line two here.",
+                           "Line three here."]
+
+
+def test_make_thumbnail_creates_1280x720(tmp_path):
+    from PIL import Image
+    from scripts.make_thumbnail import build_thumbnail
+    src = tmp_path / "src.jpg"
+    Image.new("RGB", (800, 600), (30, 120, 90)).save(src)
+    out = tmp_path / "thumbnail.jpg"
+    res = build_thumbnail(src, "5 EDITS TESTED", out)
+    assert res["ok"], res
+    assert res["text"] == "5 EDITS TESTED"
+    im = Image.open(out)
+    assert im.size == (1280, 720) and im.format == "JPEG"
+
+
+def test_make_thumbnail_truncates_text_to_3_words(tmp_path):
+    from PIL import Image
+    from scripts.make_thumbnail import build_thumbnail
+    src = tmp_path / "src.jpg"
+    Image.new("RGB", (640, 360), (10, 10, 10)).save(src)
+    out = tmp_path / "thumbnail.jpg"
+    res = build_thumbnail(src, "one two three four five", out)
+    assert res["ok"], res
+    assert res["text"] == "ONE TWO THREE"
+    assert "first 3" in res["note"]
+
+
+def test_stage_visual_records_thumbnail_when_still_exists(tmp_path):
+    from PIL import Image
+    from src.workers.base import MockLLM
+    from scripts.creator_os_run import stage_visual
+    import argparse
+    out_dir = tmp_path / "out"
+    stills = out_dir / "video_work" / "stills"
+    stills.mkdir(parents=True)
+    Image.new("RGB", (1080, 1920), (40, 90, 140)).save(stills / "scene1.jpg")
+    args = argparse.Namespace(topic="Nano Banana 2 free test",
+                              format="short video", title="", thumb="",
+                              brand="generic", footage="")
+    stage_visual(args, out_dir, MockLLM())
+    text = (out_dir / "03-visual-package.md").read_text(encoding="utf-8")
+    assert "thumbnail.jpg" in text
+    assert "NANO BANANA 2" in text  # thumb = first 3 words of the title
+    thumb = Image.open(out_dir / "thumbnail.jpg")
+    assert thumb.size == (1280, 720)
+
+
+def test_stage_visual_no_visual_records_honest_note(tmp_path):
+    from src.workers.base import MockLLM
+    from scripts.creator_os_run import stage_visual
+    import argparse
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    args = argparse.Namespace(topic="Nano Banana 2 free test",
+                              format="short video", title="", thumb="",
+                              brand="generic", footage="")
+    stage_visual(args, out_dir, MockLLM())
+    text = (out_dir / "03-visual-package.md").read_text(encoding="utf-8")
+    assert "Not built" in text
+    assert "no thumbnail built" in text
+    assert not (out_dir / "thumbnail.jpg").exists()
+
+
 def test_provider_routing_flags_and_env(monkeypatch):
     cfg, errors = vp.resolve(_provider_args(video_provider="local"))
     assert errors == []
@@ -467,6 +695,80 @@ def test_local_provider_no_command_fails_honestly(tmp_path):
     assert result["cut_path"] is None
     assert "no command configured" in result["reason"]
     assert "UNVERIFIED" in " ".join(result["missing"])
+
+
+def test_local_command_template_braces_fail_honestly(tmp_path):
+    # A literal {brace} in the user's command (e.g. a JSON body)
+    # used to crash str.format and break the "never raises" rule.
+    # Now it is recorded per scene instead.
+    cfg = vp.ProviderConfig(
+        provider="local", local_engine="custom",
+        local_cmd="python3 -c \"print({\\\"a\\\": 1})\" "
+                  "--out \"{output}\"",
+        local_timeout=60)
+    provider = vp.LocalProvider(
+        cfg, gpu_probe=lambda: (True, "fake GPU"))
+    result = provider.generate(_provider_ctx(tmp_path))
+    assert result["cut_path"] is None
+    assert result["provider_scenes"], result
+    assert all(not r["ok"] for r in result["provider_scenes"])
+    assert all("did not parse" in r["note"]
+               for r in result["provider_scenes"])
+
+
+def test_video_dry_run_describes_without_executing(tmp_path):
+    # A command that would write a marker file if executed: the
+    # dry run must print it and never run it.
+    marker = tmp_path / "SHOULD_NOT_EXIST.txt"
+    cfg = vp.ProviderConfig(
+        provider="local", local_engine="custom",
+        local_cmd=f"{sys.executable} -c "
+                  f"\"open('{marker}', 'w').write('x')\" "
+                  f"--out \"{{output}}\"",
+        local_timeout=60)
+    args = _provider_args(video_provider="local")
+    lines = vp.describe_plan(args, cfg, _provider_ctx(tmp_path))
+    blob = "\n".join(lines)
+    assert "provider: local" in blob
+    assert "local_scene1.mp4" in blob
+    assert not marker.exists()
+    # Wangp with nothing configured: dry run names the missing
+    # setup instead of running anything.
+    cfg2 = vp.ProviderConfig(provider="local", local_engine="wangp")
+    lines2 = vp.describe_plan(args, cfg2, _provider_ctx(tmp_path))
+    blob2 = "\n".join(lines2)
+    assert "GPU: NOT FOUND" in blob2
+    assert "MISSING:" in blob2
+
+
+def test_video_dry_run_runner_builds_no_video(tmp_path):
+    out_dir = tmp_path / "out"
+    code = run_pipeline([
+        "--topic", "Nano Banana 2 free test",
+        "--format", "short video",
+        "--video-provider", "local",
+        "--video-dry-run",
+        "--out", str(out_dir),
+    ])
+    assert code == 0
+    assert not (out_dir / "video.mp4").exists()
+    text = (out_dir / "04-video.md").read_text(encoding="utf-8")
+    assert "Dry run" in text
+    assert "nothing was executed" in text
+
+
+def test_resolve_provider_selection():
+    cfg_local, errors = vp.resolve(
+        _provider_args(video_provider="local"))
+    assert errors == []
+    assert vp.resolve_provider(
+        _provider_args(video_provider="local"), cfg_local) == "local"
+    cfg_api, errors = vp.resolve(_provider_args(video_provider="api"))
+    assert errors == []
+    assert vp.resolve_provider(
+        _provider_args(video_provider="api"), cfg_api) == "api"
+    cfg_auto, _ = vp.resolve(_provider_args())
+    assert vp.resolve_provider(_provider_args(), cfg_auto) == "stills"
 
 
 def test_api_provider_missing_key_fails_honestly(tmp_path, monkeypatch):

@@ -116,11 +116,18 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 # ---------------------------------------------------------------------------
 # small shared helpers (also used by scripts/video_build.py)
 # ---------------------------------------------------------------------------
-def _run(cmd: list[str], timeout: int = 180) -> tuple[bool, str]:
-    """Run a local command; returns (ok, stderr-tail-or-output)."""
+def _run(cmd: list[str], timeout: int = 180,
+         input_text: str | None = None) -> tuple[bool, str]:
+    """Run a local command; returns (ok, stderr-tail-or-output).
+
+    `input_text`, when given, is fed to the command's stdin (and
+    stdin is then closed). This matters: a command that reads its
+    input from stdin waits forever when nothing is fed — see
+    tts_line in video_build.py.
+    """
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, input=input_text)
     except subprocess.TimeoutExpired:
         return False, f"timed out after {timeout}s: {cmd[0]}"
     except Exception as exc:  # noqa: BLE001 - record, don't crash
@@ -306,16 +313,19 @@ def _scene_segment_from_clip(clip: Path, scene_dur: float, width: int,
     return seg, "ok"
 
 
-def scene_prompts() -> list[dict]:
+def scene_prompts(topic: str | None = None,
+                  brand: str | None = None) -> list[dict]:
     """One generation prompt per scene of the fixed 3-scene story.
 
     Reuses the same scene descriptions as the stills generator so
     the story stays consistent across providers. Prompts show
     workers from behind / hands / over-the-shoulder — never a
-    recognizable face, never a named real person.
+    recognizable face, never a named real person. The scene set is
+    brand-aware (gen_visuals.scenes_for): Talvenor's story only
+    for Talvenor topics, the neutral test-on-screen story otherwise.
     """
     out = []
-    for spec in gen_visuals.SCENES:
+    for spec in gen_visuals.scenes_for(topic, brand):
         out.append({
             "scene": spec["scene"],
             "shows": spec["shows"],
@@ -625,7 +635,8 @@ class StillsProvider(VideoProvider):
         result = _empty_result("stills")
         result["gen"]["attempted"] = True
         stills = gen_visuals.generate_stills(work / "stills", width,
-                                             height)
+                                             height,
+                                             scenes=ctx.get("scenes"))
         result["gen"]["per_scene"] = stills
         result["provider_scenes"] = [
             {"scene": s["scene"], "ok": s["ok"], "path": s.get("path"),
@@ -721,7 +732,7 @@ class LocalProvider(VideoProvider):
         work: Path = ctx["work"]
         width, height = ctx["width"], ctx["height"]
         scene_count = ctx["scene_count"]
-        scenes = scene_prompts()
+        scenes = ctx.get("scenes") or scene_prompts()
         engine = cfg.local_engine
         result = _empty_result("local")
         result["source"] = f"local video ({engine})"
@@ -847,7 +858,8 @@ class LocalProvider(VideoProvider):
         stills: list[dict] = []
         if need_image:
             stills = gen_visuals.generate_stills(
-                work / "stills", width, height)
+                work / "stills", width, height,
+                scenes=ctx.get("scenes"))
             result["gen"]["attempted"] = True
             result["gen"]["per_scene"] = stills
             if not any(s["ok"] for s in stills):
@@ -866,14 +878,27 @@ class LocalProvider(VideoProvider):
             if need_image:
                 rec = stills[i] if i < len(stills) else {}
                 image = rec.get("path") or ""
-            cmd_text = cfg.local_cmd.format(
-                prompt=scene["prompt"],
-                image=image,
-                duration=int(scene_dur),
-                width=width,
-                height=height,
-                output=str(out_path),
-            )
+            try:
+                cmd_text = cfg.local_cmd.format(
+                    prompt=scene["prompt"],
+                    image=image,
+                    duration=int(scene_dur),
+                    width=width,
+                    height=height,
+                    output=str(out_path),
+                )
+            except (KeyError, ValueError, IndexError) as exc:
+                # A literal {brace} in the user's command (e.g. a JSON
+                # body) breaks str.format — record it honestly per
+                # scene instead of crashing the provider, which must
+                # never raise.
+                records.append({"scene": scene["scene"], "ok": False,
+                                "path": None,
+                                "note": f"command template did not parse "
+                                        f"({exc}) — check for literal "
+                                        "{braces} in local.command; double "
+                                        "them ({{ }}) to keep them literal"})
+                continue
             import shlex
             try:
                 cmd = shlex.split(cmd_text)
@@ -940,12 +965,20 @@ class LocalProvider(VideoProvider):
         if not any(r["ok"] for r in records):
             reasons = "; ".join(
                 f"scene {r['scene']}: {r['note']}" for r in records)
-            return _fail(
+            failed = _fail(
                 "local",
                 f"local generation failed for all {scene_count} scenes "
                 f"({engine}) — no video was built",
                 [f"a working local setup — every scene failed: "
                  f"{reasons}"])
+            # Keep the per-scene records (and any stills info) on
+            # the failure — the stage file shows each scene's reason,
+            # not just the summary above.
+            failed["provider_scenes"] = records
+            failed["gen"] = result.get("gen", failed["gen"])
+            failed["fallbacks"] = (result.get("fallbacks", [])
+                                   + failed["fallbacks"])
+            return failed
         segments: list[Path] = []
         sources: list[str] = []
         for i, rec in enumerate(records):
@@ -1100,7 +1133,7 @@ class ApiProvider(VideoProvider):
         work: Path = ctx["work"]
         width, height = ctx["width"], ctx["height"]
         scene_count = ctx["scene_count"]
-        scenes = scene_prompts()
+        scenes = ctx.get("scenes") or scene_prompts()
         scene_dur = 5.0 if ctx["args"].format == "short video" else 10.0
         result = _empty_result("api")
         result["source"] = f"paid cloud video ({cfg.api_model})"
@@ -1317,6 +1350,120 @@ def resolve_provider(args, cfg: ProviderConfig) -> str:
     if cfg.provider and cfg.provider != "auto":
         return cfg.provider
     return "stills"
+
+
+def describe_plan(args, cfg: ProviderConfig, ctx: dict) -> list[str]:
+    """Dry-run description of what the resolved provider WOULD do.
+
+    Pure description: no engine is started, no still is fetched, no
+    network call is made, no key value is read or printed. Use it to
+    check a GPU machine's setup before a real run
+    (--video-dry-run). Lines starting with "MISSING:" name the exact
+    setup step that would stop a real run.
+    """
+    name = resolve_provider(args, cfg)
+    lines = [f"provider: {name}"]
+    if name == "footage":
+        clips = collect_footage(getattr(args, "footage", ""))
+        lines.append(
+            f"footage: {len(clips)} clip(s) from {args.footage} — "
+            "cut to 3 scenes, voiceover + captions added")
+        return lines
+    if name == "stills":
+        lines.append(
+            "visuals: 3 AI stills (Pollinations, free, no key) + "
+            "slow Ken Burns motion")
+        lines.append(
+            "note: AI stills + motion — NOT true AI video motion "
+            "and NOT real footage")
+        return lines
+    if name == "local":
+        engine = cfg.local_engine
+        lines.append(f"engine: {engine}")
+        if engine in ("wangp", "framepack"):
+            has_gpu, gpu_note = get_provider("local", cfg).gpu_probe()
+            lines.append(
+                "GPU: " + (f"found — {gpu_note}" if has_gpu
+                           else f"NOT FOUND — {gpu_note}"))
+        if engine == "wangp":
+            wangp_dir = Path(cfg.local_wangp_dir).expanduser() \
+                if cfg.local_wangp_dir else None
+            wgp = (wangp_dir / "wgp.py") if wangp_dir else None
+            queue = Path(cfg.local_queue).expanduser() \
+                if cfg.local_queue else None
+            out_dir = Path(cfg.local_output_dir).expanduser() \
+                if cfg.local_output_dir else None
+            if not wgp or not wgp.exists():
+                lines.append(
+                    "MISSING: WanGP checkout not found — set "
+                    "local.wangp_dir in video_providers.yaml to the "
+                    "folder containing wgp.py "
+                    "(github.com/deepbeepmeep/WanGP)")
+            if not queue or not queue.exists():
+                lines.append(
+                    "MISSING: no WanGP queue file — create one in the "
+                    "WanGP web UI (Save Queue) and set local.queue")
+            if not out_dir or not out_dir.is_dir():
+                lines.append(
+                    "MISSING: no WanGP output folder — set "
+                    "local.output_dir to the folder WanGP writes "
+                    "finished clips to")
+            if wgp and wgp.exists() and queue and queue.exists():
+                lines.append(
+                    f"command: {sys.executable} {wgp} --process {queue}")
+                lines.append(
+                    "then: the newest "
+                    f"{ctx.get('scene_count', 3)} clip(s) in "
+                    f"{out_dir or 'local.output_dir'} are cut to scenes")
+            return lines
+        # framepack / custom: the command is user-supplied.
+        if not cfg.local_cmd.strip():
+            lines.append(
+                "MISSING: local.command is not set — set it in "
+                "video_providers.yaml (or LOCAL_VIDEO_CMD) to a "
+                "command with {prompt} {image} {duration} {width} "
+                "{height} {output} placeholders")
+            if engine == "framepack":
+                lines.append(
+                    "note: FramePack ships as a Gradio desktop app — "
+                    "no official headless CLI exists, so the command "
+                    "is yours to supply (see docs/gpu-video-setup.md)")
+            return lines
+        scenes = ctx.get("scenes") or scene_prompts()
+        width, height = ctx["width"], ctx["height"]
+        scene_dur = 5.0 if ctx.get("format") == "short video" else 10.0
+        work = ctx["work"]
+        for i, scene in enumerate(scenes):
+            image = (str(work / "stills" / f"scene{scene['scene']}.jpg")
+                     if engine == "framepack" else "")
+            try:
+                cmd_text = cfg.local_cmd.format(
+                    prompt=scene["prompt"], image=image,
+                    duration=int(scene_dur), width=width,
+                    height=height,
+                    output=str(work / f"local_scene{i + 1}.mp4"))
+            except (KeyError, ValueError, IndexError) as exc:
+                lines.append(
+                    f"scene {scene['scene']}: command template did not "
+                    f"parse ({exc}) — check for literal {{braces}} in "
+                    "local.command")
+                continue
+            lines.append(f"scene {scene['scene']}: {cmd_text}")
+        return lines
+    if name == "api":
+        key_env = cfg.api_key_env or "VIDEO_API_KEY"
+        lines.append(f"endpoint: POST {cfg.api_url}")
+        lines.append(f"model: {cfg.api_model}")
+        lines.append(
+            f"key: from environment variable {key_env} "
+            f"({'set' if os.environ.get(key_env) else 'NOT SET'} — "
+            "the value is never printed)")
+        lines.append(f"poll: {cfg.api_poll_url}")
+        lines.append(
+            "note: one paid request per scene; the charge happens "
+            "only on a real run, never on a dry run")
+        return lines
+    return lines
 
 
 def run_provider(args, cfg: ProviderConfig, ctx: dict) -> dict:

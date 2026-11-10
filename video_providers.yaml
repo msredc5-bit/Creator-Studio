@@ -22,9 +22,16 @@
 #   local   — open-source video models on YOUR machine (WanGP,
 #             FramePack, or any command you configure). Needs a
 #             CUDA GPU. NOT VERIFIED on the build machine (no GPU).
+#             Full setup guide: docs/gpu-video-setup.md — check your
+#             GPU, install the engine, dry-run before a real run.
+#             Three paths in short: GPU → local; no GPU → stills
+#             (default); paid tool → api, or local + custom command.
 #   api     — paid cloud video via a generic HTTP adapter. Muapi is
 #             the documented example (Sora 2 / Runway, pay per
-#             request). NOT VERIFIED with a real paid call.
+#             request). NOT VERIFIED with a real paid call. Any other
+#             cloud API with the same submit → poll → download shape
+#             works too: set api.url, api.poll_url, api.body_json
+#             and the key's env var name (api.key_env).
 provider: auto
 
 # Optional fallback, tried once if the chosen provider fails.
@@ -35,6 +42,11 @@ fallback: null
 # Extra attempts per failed scene (0 = try once).
 retries: 1
 
+# Local provider: three ways to use it — WanGP (headless batch),
+# FramePack / any image-to-video tool (needs local.command), or a
+# fully custom command. Full guide: docs/gpu-video-setup.md.
+# A GPU machine is required for wangp/framepack; without one the
+# stage fails honestly and names the missing GPU.
 local:
   # Engine: wangp | framepack | custom
   engine: wangp

@@ -13,9 +13,41 @@ description: >-
 
 One idea in, thirteen stage files out — plan, research, script, video,
 captions, publish checklist, and a plan for the *next* video learned
-from the last one's numbers. All local, $0 by default, mock writing
-unless the owner wires a live brain. **Nothing here publishes,
-uploads, sends, schedules, or spends without the owner's exact word.**
+from the last one's numbers. All local, $0 by default. **Nothing here
+publishes, uploads, sends, schedules, or spends without the owner's
+exact word.**
+
+## YOU ARE THE BRAIN — read this before you run anything
+
+The pipeline writes `[MOCK DRAFT]` **scaffolds only** — a checklist
+with the shape of each stage, never real content. It cannot write a
+real script, real research, or real captions, and no LLM API key is
+needed to fix that: **you, the agent (Claude / Muse), ARE the
+brain.** You are an LLM yourself — you do the writing, the pipeline
+does the building. The pipeline is the checklist and the builder,
+never the writer.
+
+**Two-pass flow — always do both passes:**
+
+- **Pass 1 — mock run (the demo).** Run the pipeline once. It proves
+  all 13 stages work end to end, $0, no keys, no signup. Show the
+  owner the stage files and say plainly: this is the demo — the
+  script, research, and captions inside are scaffolds, not the
+  video's real words.
+- **Pass 2 — you write the real content.** Read the stage files you
+  just made. Then write the REAL research, script, captions, and
+  description yourself — in the owner's voice (read
+  `youtube-skills/VOICE.md` first, or the channel's own videos) —
+  replacing each `[MOCK DRAFT]` scaffold in the stage files. Never
+  present a scaffold as finished work. Then write `vo-lines.txt`
+  into the out dir (one voiceover line per line; the first 3 lines
+  are the video's 3 scenes) and re-run with `--script vo-lines.txt`
+  so the video stage speaks YOUR lines, not the templates. The
+  re-run rebuilds the video and the thumbnail; everything else in
+  the out dir stays.
+
+A run that stops at pass 1 is a demo, not a video. Never tell the
+owner a pass-1 run is ready to upload.
 
 ## The 13 stages (one run, in order)
 
@@ -59,15 +91,37 @@ Output: `out/<slug>-<YYYY-MM-DD>/` — one markdown file per stage plus
 it?"** and exits. Show the stage files to the owner; do not publish
 anything yourself.
 
+That first run is only pass 1 (the demo — see YOU ARE THE BRAIN
+above). Pass 2 is where the real video comes from: you write the
+real content into the stage files, write `vo-lines.txt` (one
+voiceover line per line, first 3 = the 3 scenes) into the out dir,
+and re-run with `--script`:
+
+```bash
+# Pass 2: the video speaks your lines, not the templates.
+python3 scripts/creator_os_run.py --topic "AI tools for beginners" --format "short video" \
+    --out out/<slug>-<YYYY-MM-DD> --script out/<slug>-<YYYY-MM-DD>/vo-lines.txt
+```
+
 ## Defaults ($0) and the two things that cost
 
 - **Default is free:** mock writing (offline, deterministic, always
-  labelled `[MOCK DRAFT]`), AI-stills video (Pollinations, no key).
+  labelled `[MOCK DRAFT]`) — and YOU replace it with real writing
+  in pass 2 (see YOU ARE THE BRAIN). AI-stills video (Pollinations,
+  no key).
 - **True AI video motion costs the owner** — their own CUDA GPU
   (`--video-provider local`, WanGP/FramePack) or their own paid key
   (`--video-provider api`, e.g. Muapi Sora). Keys live ONLY in
   environment variables, never in files. Without a GPU/key the stage
-  fails honestly and names the exact missing input.
+  fails honestly and names the exact missing input. Three paths, one
+  line each: a GPU → `local` (full guide:
+  `docs/gpu-video-setup.md`; check first with
+  `--video-provider local --video-dry-run`, which prints the exact
+  command and missing setup without executing anything); no GPU →
+  `stills` (the default — AI stills + motion, NOT true motion);
+  a paid video tool → `api` (any submit → poll → download API:
+  set `api.url`, `api.poll_url`, `api.body_json`) or `local` with
+  a `custom` command for any local tool.
 - **Upload costs nothing but setup** — the owner's own YouTube OAuth
   (see below). Never upload without their exact word (`upload it`).
 

@@ -114,6 +114,17 @@ stage (`00-niche.md` … `10-next-plan.md`) plus `next-brief.json`
 (the loop's brief for the next run). The run ends by printing
 **"ship it, or change it?"** and exits.
 
+That first run is pass 1 — the demo. Its script, research, and
+captions are `[MOCK DRAFT]` scaffolds, not the video's real words.
+**You are the brain:** the agent (Claude / Muse) writes the real
+content itself — no separate LLM key is needed, the agent IS the
+LLM. Pass 2: the agent replaces each scaffold with real writing
+in the owner's voice, writes `vo-lines.txt` (one voiceover line
+per line; first 3 = the 3 scenes) into the out dir, and re-runs
+with `--script vo-lines.txt` so the video speaks the agent's
+lines. See `skills/creator-studio/SKILL.md`, "YOU ARE THE BRAIN".
+A run that stops at pass 1 is a demo, not a video.
+
 ## The four new stages (2026-11-10)
 
 ### Niche finder (stage 0a, yt-niche)
@@ -196,18 +207,23 @@ Intermediates live in `<out-dir>/video_work/` (stills in
   scenes fail, no video is built and the stage file records exactly
   why. The bottom 8% of each still is cropped (Pollinations
   watermark corner).
-- Voiceover: the three templated brand lines, spoken by the
+- Voiceover: the three templated lines, spoken by the
   `tts` binary (default voice `avocado_v2:MAI_01` — Sophia/Aria;
   override with `--voice`). If synthesis fails, that line plays
   silent and the stage file says so — never a fake voice claim.
+  Brand-aware (fixed 2026-11-10): the Talvenor missed-call lines
+  apply ONLY to Talvenor/receptionist topics (or `--brand
+  talvenor`); any other topic gets neutral lines derived from
+  the topic itself (`--brand generic` forces them).
 - Captions: line-level, burned in verbatim from the voiceover text
   (not word-level karaoke — the faster-whisper caption helper is not
   present on this machine).
-- End card: 3s, exact logo lockup from
+- End card: 3s. Talvenor runs: exact logo lockup from
   `~/workspace/talvenor-brand/logos/talvenor-logo.png`, pasted flat
   on black, never redrawn, with the brand line "You run the jobs.
   We run the phone." and the CTA "Book a call with Talvenor.
-  Link in bio."
+  Link in bio." Any other topic: text-only card, topic headline
+  + "Subscribe for the next test." — no brand logo.
 - Without `--footage` AND with `--no-gen-visuals` (or with
   `--no-video`): the stage still runs and writes its plan + the
   exact missing inputs. It builds no video and claims none.
@@ -237,6 +253,24 @@ fallback is set in the config.
 | `local` | Open-source local video models on the user's own machine (WanGP, FramePack, or a custom command) | A CUDA GPU + the model installed (see below) | $0 after hardware | True AI video motion, 5s clips per scene | **Code ready, NOT VERIFIED here** — this machine has no GPU; adapter is unit-tested with mocks only |
 | `api` | Paid cloud video via a generic HTTP adapter (Muapi Sora / Runway as the documented example) | A paid API key + billing on the provider | Pay-per-request (see below) | True AI video motion, 5s clips per scene | **Code ready, NOT verified with a real call** — tested against a fake local server only |
 
+### Which path is yours?
+
+- **Free, and you have a GPU** → `local`: true AI video motion
+  on your own PC. Follow
+  [docs/gpu-video-setup.md](docs/gpu-video-setup.md), then check
+  with `--video-provider local --video-dry-run` before a real run.
+  Needs 6 GB VRAM (FramePack) or 8 GB (WanGP).
+- **Free, no GPU** → `stills` (the default): AI stills + slow
+  motion. Works everywhere, $0, no key — but it is NOT true video
+  motion, and it is labelled as such everywhere it appears.
+- **You have a paid video tool** → `api`: any cloud video API
+  whose submit → poll → download shape matches (Muapi Sora/Runway
+  is the documented example) — set `api.url`, `api.poll_url`,
+  `api.body_json`, and `VIDEO_API_KEY` in your environment. Or
+  `local` with a `custom` command for any local tool:
+  `local.command` with `{prompt}` `{image}` `{duration}` `{width}`
+  `{height}` `{output}`.
+
 ### How to switch
 
 - Flag: `--video-provider {footage|stills|local|api|auto}` (default
@@ -259,6 +293,9 @@ fallback is set in the config.
   only.
 
 ### Local provider — setup
+
+Full step-by-step guide for a Windows PC:
+[docs/gpu-video-setup.md](docs/gpu-video-setup.md). Short version:
 
 1. Install WanGP (`deepbeepmeep/WanGP`) or FramePack
    (`lllyasviel/FramePack`) on your own machine and download the
