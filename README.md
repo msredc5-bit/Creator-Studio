@@ -1,7 +1,8 @@
 # Creator OS — Combined Content System
 
-**One idea in, nine stage drafts out. Nothing publishes until the
-owner says so.**
+**One idea in, thirteen stage files out. Nothing publishes until the
+owner says so — and the upload stage stays off unless the owner
+turns it on twice.**
 
 Creator OS joins two systems that were built separately into one
 pipeline:
@@ -9,7 +10,7 @@ pipeline:
 | Half | What it is | Lives in |
 |---|---|---|
 | **Creator Studio** (engine) | 6 Python workers that run the content flow for ANY platform and format — research, script, visual, caption, publish prep, report. Standalone now: vendored worker base, no other checkout needed. | `src/` |
-| **YouTube Agent** (skill pack) | 11 instruction skills + 6 local scoring tools, YouTube only. Adapted from Jake Schincariol's youtube-agent-skill (MIT — original copyright retained, see `LICENSE`). | `youtube-skills/` |
+| **YouTube Agent** (skill pack) | 12 instruction skills + 8 local scoring tools, YouTube only. Adapted from Jake Schincariol's youtube-agent-skill (MIT — original copyright retained, see `LICENSE`). | `youtube-skills/` |
 
 They are **not the same thing**: different code, different job,
 different origin. Creator Studio is a running program with workers;
@@ -18,13 +19,38 @@ repo wires the YouTube tools into the Creator Studio stages, so one
 run produces the full pipeline with real hook scores, title lints,
 edit lists, chapters, and retention reads — all local, all $0.
 
+## Use it in 2 minutes
+
+**Tell your AI agent (Claude, Muse, or any agent) one line:**
+
+```
+Set up Creator Studio for me: clone https://github.com/msredc5-bit/Creator-Studio, run python3 setup.py to install its skills into my agent, then run the pipeline once with --find-niche --format "short video" and show me the plan.
+```
+
+**Or one command in a terminal:**
+
+```bash
+git clone https://github.com/msredc5-bit/Creator-Studio && cd Creator-Studio && python3 setup.py
+```
+
+That installs the entry skill (`skills/creator-studio/SKILL.md` —
+the one file an agent needs to run the whole thing) plus all 12
+yt-* skills into your agent. Full setup guide: [INSTALL.md](INSTALL.md).
+Python 3.10+ and git are all you need; $0 by default.
+
 ## The combined pipeline
 
 ```
 CEO decision (gate: ok)
-  0. Plan         — yt-plan (weekly plan, from hours available)
+  0a. Niche finder — yt-niche niche_score.py (runs when --find-niche
+                    is passed or no --topic is given; skipped
+                    honestly when the topic is already known)
+  0b. Plan         — yt-plan (weekly plan, from hours available;
+                    reads the last run's next-brief.json - the loop)
   1. Research     — TopicResearcher + yt-viral swipe.py
-  2. Script       — ScriptWriter + yt-script hookscore.py (21 formulas)
+  2a. Concept     — concept_score.py (3-5 concepts scored 1-10;
+                    the picked concept feeds the Script stage)
+  2b. Script       — ScriptWriter + yt-script hookscore.py (21 formulas)
   3. Visual+Pack  — VisualProducer + yt-package title.py (title+thumb)
   4. Video        — Reel Factory build through a pluggable video
                     provider (see "Video providers" below): real
@@ -42,6 +68,13 @@ CEO decision (gate: ok)
   7. Publish prep — PublishPrep ONLY — gate: "post it" / "upload it"
   8. Report       — PerformanceTracker + yt-retention retention.py
                     (+ yt-audit, yt-comment — post-publish only)
+  9. Upload       — upload_youtube.py (DEFAULT OFF - only with
+                    --auto-upload AND YOUTUBE_UPLOAD_ENABLED=1 AND
+                    the owner's own credentials; --upload-dry-run
+                    prints the plan with no network)
+  10. Next plan   — loop_next.py (reads the last run's 08-report.md
+                    + retention CSV, writes 10-next-plan.md and
+                    next-brief.json for the next run's Plan stage)
 ```
 
 ## Run it (mock, $0)
@@ -50,6 +83,12 @@ CEO decision (gate: ok)
 python3 -m pytest tests/ -q
 python3 scripts/creator_os_run.py --topic "AI receptionist for plumbers" \
     --format "short video"
+```
+
+No topic? The niche finder picks one:
+
+```bash
+python3 scripts/creator_os_run.py --find-niche --format "short video"
 ```
 
 With inputs (all optional):
@@ -70,9 +109,59 @@ Pass `--video-provider local` (your GPU) or `--video-provider api`
 (your paid key) for true AI video motion instead of stills —
 see "Video providers" below.
 
-Output: `out/<slug>-<YYYY-MM-DD>/` with one markdown draft per
-stage (`00-plan.md` … `08-report.md`). The run ends by printing
+Output: `out/<slug>-<YYYY-MM-DD>/` with one markdown file per
+stage (`00-niche.md` … `10-next-plan.md`) plus `next-brief.json`
+(the loop's brief for the next run). The run ends by printing
 **"ship it, or change it?"** and exits.
+
+## The four new stages (2026-11-10)
+
+### Niche finder (stage 0a, yt-niche)
+
+For a fresher starting from zero. Scores candidate niches 1-10 on
+demand (30%), competition gap (30% — lower competition scores
+higher), monetization (25%), fresher-fit (15% — can a beginner
+start with $0 + a phone/PC). Runs when `--find-niche` is passed or
+no `--topic` is given; the picked niche becomes the run's topic.
+Feed your own research with `--niches niches.json` — without it,
+fixed mock samples are scored (labelled SAMPLE, not findings). The
+tool scores the signals you feed it; it never fetches the web.
+
+### Viral concept score (stage 2a)
+
+After Research, before Script. Scores 3-5 video concepts 1-10 on
+hook strength (40%), trend-fit (25%), competition gap (20%),
+fresher-fit (15%) — weights adapted from the viral-clips skill,
+which scores finished clips as hook 40% + standalone value 30% +
+emotional energy 20% + CTA fit 10%. The picked concept feeds the
+Script stage (its hook is the one hookscore.py scores). Only 7+
+counts as strong. Feed real concepts with `--concepts
+concepts.json`; without it, five deterministic template angles are
+scored from the topic (mock, labelled SAMPLE).
+
+### Auto-upload (stage 9)
+
+DEFAULT OFF. Runs only with `--auto-upload` AND
+`YOUTUBE_UPLOAD_ENABLED=1` AND the owner's own credentials
+(`--credentials` / `YOUTUBE_CLIENT_SECRETS_FILE` for the OAuth
+client secrets, `--token` / `YOUTUBE_TOKEN_FILE` for the stored
+refresh token). Real YouTube Data API v3 resumable upload, privacy
+defaults to `private`. `--upload-dry-run` prints exactly what WOULD
+upload (title, description, tags, file, privacy) with no network
+call. Without credentials it fails honestly in `09-upload.md`,
+listing the exact setup steps (Cloud Console project + YouTube
+Data API v3 + OAuth consent once). No real upload has been made
+from this repo yet — the code path is tested dry-run only.
+
+### Closed loop (stage 10)
+
+Reads the last run's `08-report.md` (+ the retention CSV when one
+exists — `--retention`, or `--prev-out out/<last-run>/`) and writes
+`10-next-plan.md` (keep / change / next topic angle, rule-based,
+only from numbers actually present) plus `next-brief.json`, which
+the next run's Plan stage reads automatically (most recent sibling
+run, or `--brief path`). With no performance data yet it says so
+honestly and lists exactly what to collect — nothing is invented.
 
 ## The video stage (stage 4, Reel Factory)
 
@@ -241,14 +330,27 @@ HTTP server that returns a canned clip.
 - `post it` — publish a post. `upload it` — upload a video.
 - Nothing publishes, uploads, sends, schedules, or spends from this
   repo. Stage 7 is a checklist with `ready_to_publish: false`.
-  The owner publishes, if at all, with their exact word.
+  Stage 9 (auto-upload) is off by default and needs TWO switches
+  (`--auto-upload` + `YOUTUBE_UPLOAD_ENABLED=1`) plus the owner's
+  own credentials — it never uploads on its own. The owner
+  publishes, if at all, with their exact word.
 
 ## File map
 
 ```
 README.md                  — this file
+INSTALL.md                 — setup for a new person (3 ways + the
+                             one-line agent prompt)
+setup.py                   — one-command skill installer (stdlib
+                             only, no network, no keys, $0)
+setup.sh                   — thin wrapper: python3 setup.py "$@",
+                             clear error when python3 is missing
 LICENSE                    — MIT (Jake Schincariol + combined work)
 .gitignore
+skills/
+  creator-studio/
+    SKILL.md               — THE entry skill: one file an agent reads
+                             to run the whole 13-stage pipeline
 src/
   __init__.py
   creator_workers.py       — the 6 Creator Studio workers
@@ -256,25 +358,40 @@ src/
     base.py                — vendored WorkerBase + Task + MockLLM
                              (+ LiveLLMProvider hook, unwired by design)
 scripts/
-  creator_os_run.py        — the 9-stage combined runner
+  creator_os_run.py        — the 13-stage combined runner
   video_build.py           — Reel Factory video stage (FFmpeg + tts,
                              resolves the video provider, then
                              builds from its visuals)
   video_providers.py       — pluggable video providers
                              (footage / stills / local / api) —
-                             the second network-calling module:
-                             the api provider calls a paid video
-                             API only when the user configures it
-                             with their own key
+                             a network-calling module: the api
+                             provider calls a paid video API only
+                             when the user configures it with their
+                             own key
   gen_visuals.py           — AI still generation (Pollinations, free,
                              no key) — a network-calling module
+  upload_youtube.py        — stage 9 auto-upload (YouTube Data API
+                             v3, resumable) — DEFAULT OFF, needs
+                             flag + env var + the owner's own
+                             credentials; a network-calling module
+  loop_next.py             — stage 10 closed loop (reads 08-report.md
+                             + retention CSV, writes 10-next-plan.md
+                             + next-brief.json; no network, no keys)
 video_providers.yaml       — provider config (documented, no
                              secrets): provider, fallback, local,
                              api — keys come from the environment
+tools/
+  niche_score.py           — stage 0a niche scorer (demand 30% +
+                             competition-gap 30% + monetization 25% +
+                             fresher-fit 15%)
+  concept_score.py         — stage 2a concept scorer (hook 40% +
+                             trend-fit 25% + competition-gap 20% +
+                             fresher-fit 15%, adapted from the
+                             viral-clips skill)
 tests/
   test_combined.py         — pytest, mock end-to-end (replaces the old
                              boss-ceo-dependent test_creator.py)
-youtube-skills/            — 11 yt-* skills, 6 Python tools, hooks.json,
+youtube-skills/            — 12 yt-* skills, 8 Python tools, hooks.json,
                              VOICE.md (DRAFT), UPSTREAM-LICENSE
                              (untouched from the adaptation)
 out/                       — generated stage drafts (gitignored)
@@ -298,19 +415,26 @@ out/                       — generated stage drafts (gitignored)
   video and names the exact footage needed). Missing inputs are
   named, never invented.
 - **Almost no network calls.** The core pipeline (`src/`, the runner,
-  the YouTube tools) makes no network calls. The two exceptions are
+  the YouTube tools) makes no network calls. The three exceptions are
   `scripts/gen_visuals.py`, which fetches free stills from
-  Pollinations.ai (no API key), and `scripts/video_providers.py`,
-  whose api provider calls a paid video API only when the user
-  configures it with their own key — both clearly documented in
-  their modules and enforced by a test
-  (`test_network_calls_only_in_documented_modules`).
+  Pollinations.ai (no API key), `scripts/video_providers.py`, whose
+  api provider calls a paid video API only when the user configures
+  it with their own key, and `scripts/upload_youtube.py`, which calls
+  the YouTube Data API only when the owner enables the upload stage
+  twice (flag + env var) with their own credentials — all clearly
+  documented in their modules and enforced by tests
+  (`test_network_calls_only_in_documented_modules`,
+  `test_no_network_code_in_src_and_scripts`).
   The live-LLM hook (`LiveLLMProvider` in `src/workers/base.py`)
   reads its key only from the environment variable
   `CREATOR_OS_LLM_API_KEY` and is deliberately unwired — this repo
   makes no other network calls by design.
 - **Performance numbers are never estimated** — only what the owner
   pastes from the platforms.
+- **Auto-upload has never run for real from this repo.** The code
+  path is tested dry-run only (no network, no credentials). A real
+  upload needs the owner's YouTube OAuth credentials and has not
+  been verified end to end.
 
 ## Rules (inherited from both halves — unchanged)
 
@@ -342,3 +466,8 @@ repo).
   `e1556e5e`, 31 files.
 - The pluggable video providers (this change) are **not pushed
   yet** — pushing is a separate step, handled by the parent.
+- The 4 missing pieces (niche finder, viral concept score,
+  auto-upload, closed loop) were built **2026-11-10, local only** —
+  13 stages, pytest 39/39 green, mock end-to-end verified. **Not
+  pushed yet** — pushing is a separate step, handled by the parent
+  on Boss's word.

@@ -27,8 +27,10 @@ from scripts.creator_os_run import main as run_pipeline  # noqa: E402
 
 ALLOWED_GATES = {"ok", "post it", "upload it", "send", "go", None}
 STAGE_FILES = [
+    "00-niche.md",
     "00-plan.md",
     "01-research.md",
+    "02-concept-score.md",
     "02-script.md",
     "03-visual-package.md",
     "04-video.md",
@@ -36,6 +38,8 @@ STAGE_FILES = [
     "06-caption-seo.md",
     "07-publish-prep.md",
     "08-report.md",
+    "09-upload.md",
+    "10-next-plan.md",
 ]
 
 
@@ -261,13 +265,16 @@ def test_video_stage_generates_stills_and_builds_video_without_footage(tmp_path)
 def test_no_network_code_in_src_and_scripts():
     banned = ["urllib", "requests", "http.client", "socket", "httpx",
               "aiohttp"]
-    # The two documented exceptions: scripts/gen_visuals.py calls the
-    # free Pollinations image service (no key), and
-    # scripts/video_providers.py calls a paid video API only when the
-    # user configures the api provider with their own key. Everything
+    # The three documented exceptions: scripts/gen_visuals.py calls the
+    # free Pollinations image service (no key), scripts/video_providers.py
+    # calls a paid video API only when the user configures the api
+    # provider with their own key, and scripts/upload_youtube.py calls
+    # the YouTube Data API only when the owner enables the upload stage
+    # twice (flag + env var) with their own credentials. Everything
     # else in src/, scripts/, and tests/ makes no network calls.
     allowed = {ROOT / "scripts" / "gen_visuals.py",
-               ROOT / "scripts" / "video_providers.py"}
+               ROOT / "scripts" / "video_providers.py",
+               ROOT / "scripts" / "upload_youtube.py"}
     for base in (ROOT / "src", ROOT / "scripts", ROOT / "tests"):
         for path in base.rglob("*.py"):
             if path.name == Path(__file__).name:
@@ -280,14 +287,17 @@ def test_no_network_code_in_src_and_scripts():
 
 
 def test_network_calls_only_in_documented_modules():
-    """No .py file may call the network except the two documented
-    ones: gen_visuals.py (free Pollinations images, no key) and
+    """No .py file may call the network except the three documented
+    ones: gen_visuals.py (free Pollinations images, no key),
     video_providers.py (paid video API, only when the user configures
-    the api provider with their own key). (Naming the services in
+    the api provider with their own key), and upload_youtube.py
+    (YouTube Data API, only when the owner enables the upload stage
+    twice with their own credentials). (Naming the services in
     labels/docstrings is fine — the call itself lives only in those
-    two files.)"""
+    three files.)"""
     allowed = {ROOT / "scripts" / "gen_visuals.py",
-               ROOT / "scripts" / "video_providers.py"}
+               ROOT / "scripts" / "video_providers.py",
+               ROOT / "scripts" / "upload_youtube.py"}
     for base in (ROOT / "src", ROOT / "scripts", ROOT / "tests"):
         for path in base.rglob("*.py"):
             if path.name == Path(__file__).name:
@@ -582,6 +592,276 @@ def test_pipeline_bad_provider_in_config(tmp_path):
     assert "unknown video provider 'bogus'" in text
     assert "configuration error" in text
     assert not (out_dir / "video.mp4").exists()
+
+
+# ---------------------------------------------------------------------------
+# The 4 new pieces (2026-11-10): niche finder, concept score,
+# auto-upload, closed loop. Mock/dry-run only - no network, no
+# real upload, no keys.
+# ---------------------------------------------------------------------------
+def _run_tool(tool: Path, args: list[str], **kw):
+    return subprocess.run(
+        [sys.executable, str(tool), *args],
+        capture_output=True, text=True, timeout=60, cwd=str(ROOT), **kw)
+
+
+def test_niche_score_mock_samples():
+    import json
+    proc = _run_tool(ROOT / "tools" / "niche_score.py", ["--json"])
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["sample"] is True
+    assert data["weights"] == {"demand": 0.3, "competition_gap": 0.3,
+                               "monetization": 0.25, "fresher_fit": 0.15}
+    rows = data["ranked"]
+    assert len(rows) == 5
+    totals = [r["total"] for r in rows]
+    assert totals == sorted(totals, reverse=True)
+    assert all(1 <= t <= 10 for t in totals)
+    assert data["picked"] == rows[0]["name"]
+    # competition gap is 100 - competition (lower competition wins)
+    first = rows[0]
+    assert first["parts"]["competition_gap"] == (
+        100 - {"AI tools tutorials for beginners": 62,
+               "Small business bookkeeping basics": 40,
+               "Plumbing how-to for homeowners": 55,
+               "Budget home cooking": 80,
+               "Beginner guitar in 30 days": 74}[first["name"]])
+
+
+def test_niche_score_with_input_file(tmp_path):
+    import json
+    niches = tmp_path / "niches.json"
+    niches.write_text(json.dumps([
+        {"name": "Perfect", "demand": 100, "competition": 0,
+         "monetization": 100, "fresher_fit": 100},
+        {"name": "Average", "demand": 50, "competition": 50,
+         "monetization": 50, "fresher_fit": 50},
+    ]), encoding="utf-8")
+    proc = _run_tool(ROOT / "tools" / "niche_score.py",
+                     ["--niches", str(niches), "--json"])
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["sample"] is False
+    assert data["ranked"][0]["name"] == "Perfect"
+    assert data["ranked"][0]["total"] == 10.0
+    assert data["ranked"][1]["total"] == 5.0
+    assert data["picked"] == "Perfect"
+
+
+def test_niche_score_rejects_bad_signals(tmp_path):
+    import json
+    niches = tmp_path / "niches.json"
+    niches.write_text(json.dumps([
+        {"name": "Bad", "demand": 50, "competition": 150,
+         "monetization": 50, "fresher_fit": 50},
+    ]), encoding="utf-8")
+    proc = _run_tool(ROOT / "tools" / "niche_score.py",
+                     ["--niches", str(niches), "--json"])
+    assert proc.returncode == 2
+    assert "outside 0-100" in proc.stderr
+
+
+def test_concept_score_mock_templates():
+    import json
+    proc = _run_tool(ROOT / "tools" / "concept_score.py",
+                     ["--topic", "AI receptionist for plumbers", "--json"])
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["sample"] is True
+    assert data["weights"] == {"hook_strength": 0.4, "trend_fit": 0.25,
+                               "competition_gap": 0.2,
+                               "fresher_fit": 0.15}
+    rows = data["ranked"]
+    assert len(rows) == 5
+    assert rows[0]["total"] >= 7, "picked concept must be STRONG (7+)"
+    assert data["picked"] == rows[0]["concept"]
+    assert rows[0]["band"] == "STRONG"
+    assert all("hook" in r for r in rows)
+
+
+def test_concept_score_with_input_file(tmp_path):
+    import json
+    concepts = tmp_path / "concepts.json"
+    concepts.write_text(json.dumps([
+        {"concept": "Perfect", "hook": "Watch this.",
+         "hook_strength": 100, "trend_fit": 100,
+         "competition_gap": 100, "fresher_fit": 100},
+        {"concept": "Weak", "hook": "Hello.",
+         "hook_strength": 10, "trend_fit": 10,
+         "competition_gap": 10, "fresher_fit": 10},
+    ]), encoding="utf-8")
+    proc = _run_tool(ROOT / "tools" / "concept_score.py",
+                     ["--concepts", str(concepts), "--json"])
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["ranked"][0]["total"] == 10.0
+    assert data["ranked"][1]["total"] == 1.0
+    assert data["picked"] == "Perfect"
+
+
+def test_upload_dry_run_writes_plan_no_network(tmp_path):
+    import json
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake-video-bytes")
+    proc = _run_tool(ROOT / "scripts" / "upload_youtube.py",
+                     ["--video", str(video), "--title", "Test title",
+                      "--description", "d", "--tags", "a", "b",
+                      "--dry-run", "--json"])
+    assert proc.returncode == 0, proc.stderr
+    plan = json.loads(proc.stdout)
+    assert plan["dry_run"] is True
+    assert plan["title"] == "Test title"
+    assert plan["privacy"] == "private"
+    assert plan["size_bytes"] == len(b"fake-video-bytes")
+    assert "nothing was sent" in plan["note"].lower()
+
+
+def test_upload_missing_credentials_fails_honestly(tmp_path, monkeypatch):
+    from scripts.upload_youtube import UploadError, resolve_credentials
+    for var in ("YOUTUBE_CLIENT_SECRETS_FILE", "YOUTUBE_TOKEN_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        resolve_credentials(None, None)
+    except UploadError as exc:
+        assert "YOUTUBE_CLIENT_SECRETS_FILE" in str(exc)
+        assert "YOUTUBE_TOKEN_FILE" in str(exc)
+    else:
+        raise AssertionError("expected UploadError for missing credentials")
+    # CLI path: enabled but no credentials -> exit 1, names the gap.
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"x")
+    env = {"YOUTUBE_UPLOAD_ENABLED": "1",
+           "PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "upload_youtube.py"),
+         "--video", str(video), "--title", "t"],
+        capture_output=True, text=True, timeout=60, cwd=str(ROOT),
+        env=env)
+    assert proc.returncode == 1
+    assert "missing upload credentials" in proc.stderr
+
+
+def test_upload_stage_off_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("YOUTUBE_UPLOAD_ENABLED", raising=False)
+    out_dir = _run_mock_pipeline(tmp_path)
+    text = (out_dir / "09-upload.md").read_text(encoding="utf-8")
+    assert "NOT ENABLED" in text
+    assert "nothing was uploaded" in text
+    assert "YOUTUBE_UPLOAD_ENABLED=1" in text
+
+
+def test_upload_stage_flag_without_env_stays_off(tmp_path, monkeypatch):
+    monkeypatch.delenv("YOUTUBE_UPLOAD_ENABLED", raising=False)
+    out_dir = tmp_path / "out"
+    code = run_pipeline([
+        "--topic", "AI receptionist for plumbers",
+        "--format", "short video",
+        "--niche", "US home-service owners",
+        "--no-gen-visuals",
+        "--auto-upload",
+        "--out", str(out_dir),
+    ])
+    assert code == 0
+    text = (out_dir / "09-upload.md").read_text(encoding="utf-8")
+    assert "NOT ENABLED" in text
+    assert "nothing was uploaded" in text
+
+
+def test_loop_next_no_data_honest(tmp_path):
+    from scripts.loop_next import build_plan
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    brief = build_plan(out_dir, None, None)
+    assert brief["status"] == "no-data"
+    text = (out_dir / "10-next-plan.md").read_text(encoding="utf-8")
+    assert "No performance data yet" in text
+    assert "nothing was invented" in text.lower()
+    assert (out_dir / "next-brief.json").exists()
+
+
+def test_loop_next_with_report(tmp_path):
+    import json
+    from scripts.loop_next import build_plan
+    prev = tmp_path / "prev-run"
+    prev.mkdir()
+    (prev / "08-report.md").write_text(
+        "# Stage 8 — Report\n\n- Points read: 40\n"
+        "- Start → end: 100% → 32%\n"
+        "- Hook leak: 35% lost in the opening\n"
+        "- Cliff: -12% at 0:42\n",
+        encoding="utf-8")
+    out_dir = tmp_path / "new-run"
+    out_dir.mkdir()
+    brief = build_plan(out_dir, prev, None)
+    assert brief["status"] == "ok"
+    assert any("Hook leaks 35" in c for c in brief["change"])
+    assert any("0:42" in c for c in brief["change"])
+    assert brief["numbers_used"]["hook_leak"] == 35.0
+    text = (out_dir / "10-next-plan.md").read_text(encoding="utf-8")
+    assert "Hook leaks 35%" in text
+    saved = json.loads((out_dir / "next-brief.json").read_text())
+    assert saved["status"] == "ok"
+    assert saved["source_run"] == str(prev)
+
+
+def test_pipeline_find_niche_end_to_end(tmp_path):
+    out_dir = tmp_path / "out"
+    code = run_pipeline([
+        "--find-niche",
+        "--format", "short video",
+        "--no-gen-visuals",
+        "--out", str(out_dir),
+    ])
+    assert code == 0
+    for name in STAGE_FILES:
+        path = out_dir / name
+        assert path.exists(), f"missing stage file: {name}"
+        assert path.stat().st_size > 200, f"stage file too small: {name}"
+    niche = (out_dir / "00-niche.md").read_text(encoding="utf-8")
+    assert "Picked niche" in niche
+    assert "AI tools tutorials for beginners" in niche
+    plan = (out_dir / "00-plan.md").read_text(encoding="utf-8")
+    assert "AI tools tutorials for beginners" in plan
+    concept = (out_dir / "02-concept-score.md").read_text(encoding="utf-8")
+    assert "Picked concept" in concept
+    script = (out_dir / "02-script.md").read_text(encoding="utf-8")
+    assert "Concept picked" in script
+    assert "Verdict" in script
+    upload = (out_dir / "09-upload.md").read_text(encoding="utf-8")
+    assert "NOT ENABLED" in upload
+    loop = (out_dir / "10-next-plan.md").read_text(encoding="utf-8")
+    assert "No performance data yet" in loop
+    import json
+    brief = json.loads((out_dir / "next-brief.json").read_text())
+    assert brief["status"] == "no-data"
+    assert not (out_dir / "video.mp4").exists()
+
+
+def test_plan_reads_next_brief(tmp_path):
+    import json
+    runs = tmp_path / "runs"
+    prev = runs / "prev-run"
+    prev.mkdir(parents=True)
+    (prev / "next-brief.json").write_text(json.dumps({
+        "status": "ok", "date": "2026-11-10",
+        "source_run": str(prev),
+        "keep": ["Ending holds at 55% retention"],
+        "change": ["Hook leaks 35% - rewrite the hook"],
+        "next_topic_angle": "Open on the payoff.",
+    }), encoding="utf-8")
+    out_dir = runs / "new-run"
+    code = run_pipeline([
+        "--topic", "AI receptionist for plumbers",
+        "--format", "short video",
+        "--no-gen-visuals",
+        "--out", str(out_dir),
+    ])
+    assert code == 0
+    plan = (out_dir / "00-plan.md").read_text(encoding="utf-8")
+    assert "Carried over from the last video" in plan
+    assert "Hook leaks 35%" in plan
+    assert "Ending holds at 55%" in plan
 
 
 def _main() -> int:
