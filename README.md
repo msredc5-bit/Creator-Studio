@@ -391,6 +391,17 @@ tools/
 tests/
   test_combined.py         — pytest, mock end-to-end (replaces the old
                              boss-ceo-dependent test_creator.py)
+  test_setup.py            — pytest for setup.py (dry-run changes
+                             nothing, temp install lands all skills,
+                             no overwrite without --force)
+.github/
+  workflows/
+    python-app.yml         — CI: runs pytest on every push / PR to
+                             main (Python 3.12, FFmpeg, read-only)
+Creator-Studio-A-to-Z-brief.md — full A-to-Z brief of the system
+TESTING.md                 — first-time tester checklist (clone →
+                             setup → tests → first run → what to
+                             report if it fails)
 youtube-skills/            — 12 yt-* skills, 8 Python tools, hooks.json,
                              VOICE.md (DRAFT), UPSTREAM-LICENSE
                              (untouched from the adaptation)
@@ -456,18 +467,20 @@ the original author's work, preserved as-is; only the tool-coupling
 mechanics were changed (see the adaptation changelog in the YouTube
 repo).
 
-## GitHub status (2026-11-07)
+## GitHub status (2026-11-10)
 
-- Pushed 2026-11-06 23:24 Dhaka:
-  https://github.com/msredc5-bit/Creator-Studio (PRIVATE),
+- Pushed 2026-11-06: https://github.com/msredc5-bit/Creator-Studio,
   commit `53a5a99b`, 29 files (the 8-stage combined repo).
 - Video stage pushed 2026-11-07 00:12, commit `e063d375`, 30 files;
   self-generating visuals pushed 2026-11-07 00:35, commit
-  `e1556e5e`, 31 files.
-- The pluggable video providers (this change) are **not pushed
-  yet** — pushing is a separate step, handled by the parent.
-- The 4 missing pieces (niche finder, viral concept score,
-  auto-upload, closed loop) were built **2026-11-10, local only** —
-  13 stages, pytest 39/39 green, mock end-to-end verified. **Not
-  pushed yet** — pushing is a separate step, handled by the parent
-  on Boss's word.
+  `e1556e5e`, 31 files; pluggable video providers pushed
+  2026-11-07 01:22, commit `ad08c8da`, 33 files.
+- Creator Studio v2 pushed 2026-11-10, commit `4abfa906`,
+  44 files — 13 stages (niche finder, viral concept score,
+  gated auto-upload, closed loop) + one-line agent setup
+  (`skills/creator-studio`, `setup.py`, `INSTALL.md`).
+  pytest 42/42 green, mock end-to-end verified.
+- The CI workflow (`.github/workflows/python-app.yml`) and
+  `TESTING.md` (this change) are **not pushed yet** — pushing is
+  a separate step, handled by the parent on Boss's word, before
+  the repo is flipped to public.

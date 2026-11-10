@@ -2,7 +2,7 @@
 
 **One line:** A combined content factory — 6 worker agents + 12 YouTube skills + 8 real Python tools + a 13-stage pipeline + a pluggable Video stage — that turns one topic (or a niche it finds for a fresher) into a finished video (script, titles, captions, SEO, video file), uploads it only when the owner enables upload twice, and learns from the last video's numbers for the next one.
 
-**Status (2026-11-10):** BUILT, TESTED, LOCAL ONLY — NOT PUSHED. Repo: https://github.com/msredc5-bit/Creator-Studio (PRIVATE). Latest pushed commit `ad08c8da` (2026-11-07). The 4 missing pieces (niche finder, viral concept score, auto-upload, closed loop) were built 2026-11-10 in the local folder only; pushing is Boss's word. Local folder: `~/workspace/creator-os-combined/`.
+**Status (2026-11-10):** BUILT, TESTED, PUSHED. Repo: https://github.com/msredc5-bit/Creator-Studio (PRIVATE). Latest pushed commit `4abfa906` (2026-11-10) — 13 stages, pytest 42/42 green. The CI workflow (`.github/workflows/python-app.yml`) and `TESTING.md` are new in this change and not pushed yet — pushing is Boss's word, before the repo is flipped to public. Local folder: `~/workspace/creator-os-combined/`.
 
 ---
 
@@ -115,11 +115,11 @@ CAN: find a niche for a fresher (scored 1-10) or work from a given niche; plan, 
 
 CANNOT (today): write with a live model (mock only — see §8); generate true AI video motion (region-blocked here, no GPU on the build machine, no video endpoint on the Meta $150 credit); publish anything except the owner's own enabled YouTube upload; do word-level karaoke captions (helper absent on this machine); guarantee TTS voice on every run (TTS service times out sometimes — silent fallback with an honest note; re-run when responsive); make a real YouTube upload without the owner's OAuth credentials (never verified end to end — tested dry-run only).
 
-Verified evidence: pytest 39/39 pass (2026-11-10); mock end-to-end run writes all 13 stage files + next-brief.json, with and without a topic (niche finder path); no-footage end-to-end video built real (18.0s, 1080×1920, H.264, decode OK); frame-checked stills (scene 2 phone still verified by eye); local-provider run fails honestly (no CUDA GPU); bad provider/flag rejected with clear errors; upload dry-run prints the exact plan with no network; loop with a real retention CSV produces hook-leak/cliff adjustments and a next-brief.json the next run reads.
+Verified evidence: pytest 42/42 pass (2026-11-10); mock end-to-end run writes all 13 stage files + next-brief.json, with and without a topic (niche finder path); no-footage end-to-end video built real (18.0s, 1080×1920, H.264, decode OK); frame-checked stills (scene 2 phone still verified by eye); local-provider run fails honestly (no CUDA GPU); bad provider/flag rejected with clear errors; upload dry-run prints the exact plan with no network; loop with a real retention CSV produces hook-leak/cliff adjustments and a next-brief.json the next run reads.
 
 ## 8. What is next (not yet built)
 
-DONE 2026-11-10 (local only, not pushed): **niche finder** (yt-niche + tools/niche_score.py), **viral concept score** (tools/concept_score.py, weights adapted from the viral-clips skill), **auto-upload** (scripts/upload_youtube.py, default off, dry-run tested only — no real upload made or verified), **closed loop** (scripts/loop_next.py + next-brief.json auto-read by Plan).
+DONE 2026-11-10 (pushed in `4abfa906`): **niche finder** (yt-niche + tools/niche_score.py), **viral concept score** (tools/concept_score.py, weights adapted from the viral-clips skill), **auto-upload** (scripts/upload_youtube.py, default off, dry-run tested only — no real upload made or verified), **closed loop** (scripts/loop_next.py + next-brief.json auto-read by Plan).
 
 Still to do:
 
